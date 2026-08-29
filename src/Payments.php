@@ -7,8 +7,9 @@ namespace App;
 final class Payments
 {
     /**
-     * Webhook entry point. The event is persisted first and only then acted on, so the
-     * dedup decision is made by postgres and never by application-level checking.
+     * Webhook entry point. Persist the event, apply it with SQL only, answer 200.
+     * No supplier call happens here - delivery is the worker's job, so the handler stays
+     * fast and the payment gateway never waits on an external system.
      *
      * @param  array<string, mixed> $payload
      * @return array{status: string, code: int}
@@ -48,21 +49,23 @@ final class Payments
 
         Log::info('webhook accepted', ['event_id' => $eventId, 'order_id' => $orderId, 'payment_status' => $status]);
 
-        // Stage 1 applies inline; stage 2 moves this behind bin/worker.php and the endpoint
-        // returns as soon as the event row is committed.
         return ['status' => self::apply($eventId), 'code' => 200];
     }
 
     /**
-     * Applies one stored event exactly once. Returns what actually happened.
+     * Applies one stored event exactly once. Pure SQL - the delivery it may unlock is picked
+     * up separately by the worker.
+     *
+     * Returns 'applied' | 'ignored' | 'order_missing' | 'already_applied'.
      */
     public static function apply(string $eventId): string
     {
         $pdo = Db::pdo();
         $pdo->beginTransaction();
 
-        // claiming the event and moving the order happen in one transaction, so a crash
-        // in between cannot leave the event marked applied with the order untouched
+        // The claim. Out of N concurrent appliers of the same event exactly one sees
+        // rowCount 1, and claim + order transition commit together, so a crash in between
+        // cannot leave the event marked applied with the order untouched.
         $claimed = Db::run(
             'UPDATE payment_events SET applied = true, applied_at = now()
              WHERE event_id = ? AND applied = false',
@@ -82,25 +85,60 @@ final class Payments
         $moved = Orders::transition($orderId, 'created', $target);
 
         if (!$moved && !Orders::exists($orderId)) {
-            // Webhook arrived before the order was created. Roll the claim back so the event
-            // stays pending and gets applied once the order shows up.
+            // Webhook ahead of its order. Roll the claim back so applied stays false and the
+            // worker retries later; the reason is recorded outside the transaction.
             $pdo->rollBack();
+            Db::run('UPDATE payment_events SET result = ? WHERE event_id = ?', ['order_missing', $eventId]);
             Log::info('webhook ahead of order, left pending', ['event_id' => $eventId, 'order_id' => $orderId]);
 
             return 'order_missing';
         }
 
+        // The order exists but did not move. It may have been inserted between the two
+        // statements above, so give the conditional UPDATE one more shot before concluding
+        // that the order is genuinely past 'created'.
+        if (!$moved) {
+            $moved = Orders::transition($orderId, 'created', $target);
+        }
+
+        // 'ignored' still counts as consumed: a late or superseded event must never be
+        // retried, otherwise the worker would pick it up on every pass forever.
+        $result = $moved ? 'applied' : 'ignored';
+        Db::run('UPDATE payment_events SET result = ? WHERE event_id = ?', [$result, $eventId]);
+
         $pdo->commit();
 
-        if (!$moved) {
-            // order already left 'created' - a final or in-flight order is never rewound
-            return 'no_transition';
+        return $result;
+    }
+
+    /**
+     * Worker duty #2: events that could not be applied because their order did not exist yet.
+     * The join keeps the scan to events whose order has since shown up; apply() itself does
+     * the claiming, so running several workers is safe.
+     */
+    public static function applyPending(int $limit): int
+    {
+        $pending = Db::all(
+            'SELECT e.event_id FROM payment_events e
+             JOIN orders o ON o.id = e.order_id
+             WHERE e.applied = false
+             ORDER BY e.received_at
+             LIMIT ?',
+            [$limit],
+        );
+
+        $done = 0;
+        foreach ($pending as $row) {
+            $result = self::apply((string) $row['event_id']);
+
+            // order_missing does not count as progress, otherwise an event whose order never
+            // arrives would keep the loop from ever sleeping
+            if ($result === 'applied' || $result === 'ignored') {
+                Log::info('pending event applied', ['event_id' => $row['event_id'], 'result' => $result]);
+                $done++;
+            }
         }
 
-        if ($target === 'paid') {
-            Delivery::deliver($orderId);
-        }
-
-        return 'applied';
+        return $done;
     }
 }

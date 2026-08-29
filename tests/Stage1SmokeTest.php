@@ -5,12 +5,17 @@ declare(strict_types=1);
 namespace Tests;
 
 use App\Db;
+use App\Delivery;
 use App\Env;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Smoke tests for stage 1. They run against a live stack: postgres, both supplier stubs
- * and the app itself (see the run commands in the Makefile).
+ * Smoke tests for the stage 1 API surface. They run against a live stack: postgres, both
+ * supplier stubs and the app itself (see the run commands in the Makefile).
+ *
+ * Since stage 2 the webhook handler no longer delivers - bin/worker.php does. These tests
+ * drive one delivery step synchronously via deliverNow() so they stay deterministic and do
+ * not need a worker process; the real worker loop is exercised by tests/race.sh.
  */
 final class Stage1SmokeTest extends TestCase
 {
@@ -65,6 +70,13 @@ final class Stage1SmokeTest extends TestCase
         self::assertSame(200, $status);
         self::assertSame('applied', $body['result']);
 
+        // the handler is SQL only: it must not have called a supplier
+        [, $paid] = self::request('GET', self::$base . '/api/orders/' . $orderId);
+        self::assertSame('paid', $paid['status']);
+        self::assertNull($paid['code']);
+
+        self::deliverNow($orderId);
+
         [, $order] = self::request('GET', self::$base . '/api/orders/' . $orderId);
         self::assertSame('delivered', $order['status']);
         self::assertMatchesRegularExpression('/^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/', (string) $order['code']);
@@ -87,6 +99,7 @@ final class Stage1SmokeTest extends TestCase
 
         [, $first] = self::webhook($orderId, 'paid', $eventId);
         self::assertSame('applied', $first['result']);
+        self::deliverNow($orderId);
 
         [, $delivered] = self::request('GET', self::$base . '/api/orders/' . $orderId);
         self::assertSame('delivered', $delivered['status']);
@@ -128,9 +141,36 @@ final class Stage1SmokeTest extends TestCase
         self::assertSame(200, $status);
         self::assertSame('order_missing', $body['result']);
 
-        $event = Db::one('SELECT applied FROM payment_events WHERE event_id = ?', [$eventId]);
+        $event = Db::one('SELECT applied, result FROM payment_events WHERE event_id = ?', [$eventId]);
         self::assertNotNull($event);
         self::assertFalse($event['applied']);
+        self::assertSame('order_missing', $event['result']);
+    }
+
+    public function testEventThatCannotMoveTheOrderIsConsumedNotRetried(): void
+    {
+        $orderId = self::createOrder();
+
+        [, $first] = self::webhook($orderId, 'paid', self::eventId());
+        self::assertSame('applied', $first['result']);
+
+        // a late 'failed' for an already paid order: transitions only start from 'created'
+        $lateEventId = self::eventId();
+        [, $late] = self::webhook($orderId, 'failed', $lateEventId);
+        self::assertSame('ignored', $late['result']);
+
+        // ignored still counts as consumed, otherwise the worker would pick it up forever
+        $event = Db::one('SELECT applied FROM payment_events WHERE event_id = ?', [$lateEventId]);
+        self::assertTrue($event['applied']);
+
+        [, $order] = self::request('GET', self::$base . '/api/orders/' . $orderId);
+        self::assertSame('paid', $order['status']);
+    }
+
+    /** Runs the exact claim-and-issue step bin/worker.php would run for this order. */
+    private static function deliverNow(string $orderId): void
+    {
+        self::assertSame('delivered', Delivery::deliver($orderId));
     }
 
     private static function eventId(): string

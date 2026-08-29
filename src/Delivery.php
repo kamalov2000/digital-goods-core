@@ -17,7 +17,31 @@ final class Delivery
     }
 
     /**
-     * Drives one order from paid to delivered. Stage 1 talks to supplier A only;
+     * Worker duty #1: orders sitting in 'paid' waiting for a code.
+     *
+     * The SELECT is deliberately unlocked - it only nominates candidates. The claim happens
+     * inside deliver(), where the conditional UPDATE paid -> delivering lets exactly one
+     * worker through, so two workers scanning the same batch cannot both call the supplier.
+     */
+    public static function runPending(int $limit): int
+    {
+        $orders = Db::all(
+            'SELECT id FROM orders WHERE status = ? ORDER BY updated_at LIMIT ?',
+            ['paid', $limit],
+        );
+
+        $done = 0;
+        foreach ($orders as $row) {
+            if (self::deliver((string) $row['id']) !== 'not_paid') {
+                $done++;
+            }
+        }
+
+        return $done;
+    }
+
+    /**
+     * Drives one order from paid to delivered. Stage 2 talks to supplier A only;
      * retries with backoff and the fallback to B land in stage 3.
      */
     public static function deliver(string $orderId): string
