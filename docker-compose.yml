@@ -16,5 +16,24 @@ services:
       timeout: 3s
       retries: 30
 
+  # Test/tooling runtime, not started by `docker compose up`. Used by `make race`:
+  #   docker compose run --rm runner bash tests/race.sh
+  runner:
+    build:
+      context: .
+      dockerfile: docker/php.Dockerfile
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      APP_URL: http://127.0.0.1:8000
+      SUPPLIER_A_URL: http://127.0.0.1:9001
+      SUPPLIER_B_URL: http://127.0.0.1:9002
+    volumes:
+      - .:/app
+    working_dir: /app
+
 volumes:
   pgdata:

@@ -1,4 +1,4 @@
-.PHONY: up down migrate seed serve suppliers test
+.PHONY: up down migrate seed serve suppliers worker test race
 
 up:
 	docker compose up -d
@@ -22,5 +22,14 @@ suppliers:
 	SUPPLIER_NAME=B php -S localhost:9002 suppliers/supplier.php & \
 	wait
 
+worker:
+	php bin/worker.php
+
 test:
 	vendor/bin/phpunit
+
+# race harness runs in the container: php -S is single-process on Windows and
+# PHP_CLI_SERVER_WORKERS is POSIX-only, so 50 "concurrent" webhooks would just queue up
+race:
+	docker compose up -d postgres
+	docker compose run --rm --build runner bash tests/race.sh
