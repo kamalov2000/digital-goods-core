@@ -119,6 +119,11 @@ final class Delivery
         $maxAttempts = max(1, Env::int('DELIVERY_MAX_ATTEMPTS', 4));
         $result = ['outcome' => 'failed', 'code' => null, 'error' => 'no attempt made'];
 
+        // Read the state left by earlier passes: once this request_id has been 'unknown', it
+        // stays unknown across worker restarts until a supplier hands us the code.
+        $prior = Db::one('SELECT status FROM issue_requests WHERE request_id = ?', [$requestId]);
+        $sawUnknown = ($prior['status'] ?? '') === 'unknown';
+
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             self::track($requestId, $orderId, $supplier);
 
@@ -136,6 +141,8 @@ final class Delivery
                 return $result;
             }
 
+            $sawUnknown = $sawUnknown || $result['outcome'] === 'unknown';
+
             self::storeFailure($requestId, $result);
 
             if ($result['outcome'] !== 'unknown') {
@@ -145,6 +152,16 @@ final class Delivery
             if ($attempt < $maxAttempts) {
                 self::backoff($attempt);
             }
+        }
+
+        // Uncertainty is sticky. Once an answer for this request_id was lost, a later 5xx or
+        // 409 on the SAME request_id refuses that call - it does not retract what an earlier
+        // call may already have issued. Only the supplier handing us the code resolves it.
+        // Downgrading to 'failed' here would authorise the fallback to B and hand the order a
+        // second key while the first one sits reserved.
+        if ($sawUnknown) {
+            $result['outcome'] = 'unknown';
+            self::storeFailure($requestId, $result);
         }
 
         return $result;

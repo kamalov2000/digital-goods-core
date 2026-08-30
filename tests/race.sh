@@ -65,9 +65,9 @@ php bin/migrate.php
 php bin/seed.php
 php tests/race_reset.php
 
-SUPPLIER_NAME=A php -S 127.0.0.1:9001 suppliers/supplier.php >/tmp/supplier-a.log 2>&1 &
+SUPPLIER_NAME=A PHP_CLI_SERVER_WORKERS=8 php -S 127.0.0.1:9001 suppliers/supplier.php >/tmp/supplier-a.log 2>&1 &
 SUP_A_PID=$!
-SUPPLIER_NAME=B php -S 127.0.0.1:9002 suppliers/supplier.php >/tmp/supplier-b.log 2>&1 &
+SUPPLIER_NAME=B PHP_CLI_SERVER_WORKERS=8 php -S 127.0.0.1:9002 suppliers/supplier.php >/tmp/supplier-b.log 2>&1 &
 SUP_B_PID=$!
 PHP_CLI_SERVER_WORKERS=8 php -S 127.0.0.1:8000 -t public >/tmp/app.log 2>&1 &
 APP_PID=$!

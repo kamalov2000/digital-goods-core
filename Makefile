@@ -1,4 +1,4 @@
-.PHONY: up down migrate seed serve suppliers worker test race
+.PHONY: up down migrate seed serve suppliers worker test race chaos
 
 up:
 	docker compose up -d
@@ -35,3 +35,8 @@ test:
 race:
 	docker compose up -d postgres
 	docker compose run --rm --build runner bash tests/race.sh
+
+# stage 3: timeout trap, supplier fallback, empty pool, chaos run
+chaos:
+	docker compose up -d postgres
+	docker compose run --rm --build runner bash tests/chaos.sh
