@@ -41,8 +41,8 @@ final class Delivery
     }
 
     /**
-     * Drives one order from paid to delivered. Stage 2 talks to supplier A only;
-     * retries with backoff and the fallback to B land in stage 3.
+     * Drives one order from paid to a terminal-ish status: delivered, out_of_stock or
+     * delivery_failed. Tries supplier A, falls back to B, and never gives one order two codes.
      */
     public static function deliver(string $orderId): string
     {
@@ -54,62 +54,158 @@ final class Delivery
         }
 
         $order = Db::one('SELECT id, sku FROM orders WHERE id = ?', [$orderId]);
-        $supplier = 'A';
-        $requestId = self::requestId($orderId, $supplier);
+        $sku = (string) $order['sku'];
 
+        $a = self::attempt('A', $orderId, $sku);
+        if ($a['outcome'] === 'issued') {
+            return self::finish($orderId, self::requestId($orderId, 'A'), (string) $a['code']);
+        }
+
+        // THE RULE: no fallback to B while A is 'unknown'.
+        //
+        // 'unknown' means we never got an answer - the supplier may well have reserved a key
+        // and committed the issue. Asking B now would be asking for a second code for the same
+        // order, and the first one would already be gone from the pool. Only a definite
+        // refusal ('failed') or a definite empty stock ('out_of_stock') releases us to B.
+        // A that ran out of retries while still unknown leaves the order in delivery_failed;
+        // recovery (stage 4) resumes it by replaying the SAME request_id against A, which the
+        // supplier answers with the code it already issued.
+        if ($a['outcome'] === 'unknown') {
+            Orders::transition($orderId, 'delivering', 'delivery_failed');
+            Log::error('delivery unresolved, not falling back', [
+                'order_id' => $orderId,
+                'supplier' => 'A',
+                'outcome' => 'unknown',
+                'error' => $a['error'],
+            ]);
+
+            return 'delivery_failed';
+        }
+
+        Log::info('falling back to supplier B', ['order_id' => $orderId, 'reason' => $a['outcome']]);
+
+        $b = self::attempt('B', $orderId, $sku);
+        if ($b['outcome'] === 'issued') {
+            return self::finish($orderId, self::requestId($orderId, 'B'), (string) $b['code']);
+        }
+
+        // Both empty is a stock problem, not an integration failure: recoverable by restocking.
+        $target = $a['outcome'] === 'out_of_stock' && $b['outcome'] === 'out_of_stock'
+            ? 'out_of_stock'
+            : 'delivery_failed';
+
+        Orders::transition($orderId, 'delivering', $target);
+        Log::error('delivery failed on both suppliers', [
+            'order_id' => $orderId,
+            'supplier_a' => $a['outcome'],
+            'supplier_b' => $b['outcome'],
+            'status' => $target,
+        ]);
+
+        return $target;
+    }
+
+    /**
+     * One supplier, up to DELIVERY_MAX_ATTEMPTS calls, always under the same request_id.
+     *
+     * Only 'unknown' is retried. A definite refusal or an empty pool is an answer, and
+     * repeating the call would not change it.
+     *
+     * @return array{outcome: string, code: ?string, error: ?string}
+     */
+    private static function attempt(string $supplier, string $orderId, string $sku): array
+    {
+        $requestId = self::requestId($orderId, $supplier);
+        $maxAttempts = max(1, Env::int('DELIVERY_MAX_ATTEMPTS', 4));
+        $result = ['outcome' => 'failed', 'code' => null, 'error' => 'no attempt made'];
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            self::track($requestId, $orderId, $supplier);
+
+            $result = self::callSupplier($supplier, $requestId, $orderId, $sku);
+
+            Log::info('supplier attempt', [
+                'order_id' => $orderId,
+                'request_id' => $requestId,
+                'attempt' => $attempt,
+                'outcome' => $result['outcome'],
+                'error' => $result['error'],
+            ]);
+
+            if ($result['outcome'] === 'issued') {
+                return $result;
+            }
+
+            self::storeFailure($requestId, $result);
+
+            if ($result['outcome'] !== 'unknown') {
+                break;
+            }
+
+            if ($attempt < $maxAttempts) {
+                self::backoff($attempt);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Records that an attempt is about to happen. On a retry only the counter moves: the
+     * previous status is left in place, so a worker that dies mid-call leaves the row saying
+     * 'unknown' rather than a cheerful 'pending'.
+     */
+    private static function track(string $requestId, string $orderId, string $supplier): void
+    {
         Db::run(
             'INSERT INTO issue_requests (request_id, order_id, supplier, status, attempts)
              VALUES (?, ?, ?, ?, 1)
              ON CONFLICT (request_id) DO UPDATE
-                 SET attempts = issue_requests.attempts + 1, status = ?, updated_at = now()',
-            [$requestId, $orderId, $supplier, 'pending', 'pending'],
+                 SET attempts = issue_requests.attempts + 1, updated_at = now()',
+            [$requestId, $orderId, $supplier, 'pending'],
         );
-
-        $result = self::callSupplier($supplier, $requestId, $orderId, (string) $order['sku']);
-
-        return self::record($orderId, $requestId, $result);
     }
 
-    /**
-     * @param  array{outcome: string, code: ?string, error: ?string} $result
-     */
-    private static function record(string $orderId, string $requestId, array $result): string
+    /** @param array{outcome: string, code: ?string, error: ?string} $result */
+    private static function storeFailure(string $requestId, array $result): void
     {
-        $pdo = Db::pdo();
-        $pdo->beginTransaction();
-
-        if ($result['outcome'] === 'issued') {
-            Db::run(
-                'UPDATE issue_requests SET status = ?, code = ?, last_error = NULL, updated_at = now()
-                 WHERE request_id = ?',
-                ['issued', $result['code'], $requestId],
-            );
-            $pdo->commit();
-
-            Orders::transition($orderId, 'delivering', 'delivered');
-            Log::info('code delivered', ['order_id' => $orderId, 'request_id' => $requestId]);
-
-            return 'delivered';
-        }
-
         Db::run(
             'UPDATE issue_requests SET status = ?, last_error = ?, updated_at = now() WHERE request_id = ?',
             [$result['outcome'], $result['error'], $requestId],
         );
+    }
+
+    /**
+     * Persisting the code and finishing the order happen together, so the order can never be
+     * delivered without a recorded code, nor hold a code while still sitting in 'delivering'.
+     */
+    private static function finish(string $orderId, string $requestId, string $code): string
+    {
+        $pdo = Db::pdo();
+        $pdo->beginTransaction();
+
+        Db::run(
+            'UPDATE issue_requests SET status = ?, code = ?, last_error = NULL, updated_at = now()
+             WHERE request_id = ?',
+            ['issued', $code, $requestId],
+        );
+        Orders::transition($orderId, 'delivering', 'delivered');
+
         $pdo->commit();
 
-        // both are recoverable states, not crashes: stock refill or a background retry resumes them
-        $target = $result['outcome'] === 'out_of_stock' ? 'out_of_stock' : 'delivery_failed';
-        Orders::transition($orderId, 'delivering', $target);
+        Log::info('code delivered', ['order_id' => $orderId, 'request_id' => $requestId]);
 
-        Log::error('delivery failed', [
-            'order_id' => $orderId,
-            'request_id' => $requestId,
-            'outcome' => $result['outcome'],
-            'error' => $result['error'],
-        ]);
+        return 'delivered';
+    }
 
-        return $target;
+    /** Exponential backoff with full jitter, so parallel workers do not retry in lockstep. */
+    private static function backoff(int $attempt): void
+    {
+        $base = Env::int('DELIVERY_BACKOFF_BASE_MS', 200);
+        $cap = Env::int('DELIVERY_BACKOFF_CAP_MS', 5000);
+        $window = min($cap, $base * (2 ** ($attempt - 1)));
+
+        usleep(random_int(0, max(1, $window)) * 1000);
     }
 
     /**
@@ -126,8 +222,8 @@ final class Delivery
             CURLOPT_POSTFIELDS => $body,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => Env::int('DELIVERY_TIMEOUT_SEC', 3),
-            CURLOPT_CONNECTTIMEOUT => 2,
+            CURLOPT_CONNECTTIMEOUT => Env::int('DELIVERY_CONNECT_TIMEOUT_SEC', 2),
+            CURLOPT_TIMEOUT => Env::int('DELIVERY_TIMEOUT_SEC', 5),
         ]);
 
         $response = curl_exec($ch);
@@ -136,9 +232,18 @@ final class Delivery
         curl_close($ch);
 
         if ($errno !== 0) {
-            // a timeout is not a refusal - the supplier may have issued the code anyway,
-            // so this is recorded as 'unknown' and resolved by replaying the same request_id
-            $outcome = $errno === CURLE_OPERATION_TIMEDOUT ? 'unknown' : 'failed';
+            // The split that stage 3 turns on. Left column: the request was sent but no
+            // complete answer came back - the supplier may have issued, so this is 'unknown'
+            // and may only be resolved by replaying the same request_id. Everything else
+            // never reached the supplier and is a safe, definite failure.
+            $unknown = [
+                CURLE_OPERATION_TIMEDOUT,
+                CURLE_PARTIAL_FILE,
+                CURLE_RECV_ERROR,
+                CURLE_SEND_ERROR,
+                CURLE_GOT_NOTHING,
+            ];
+            $outcome = in_array($errno, $unknown, true) ? 'unknown' : 'failed';
 
             return ['outcome' => $outcome, 'code' => null, 'error' => 'curl:' . curl_strerror($errno)];
         }
@@ -154,6 +259,8 @@ final class Delivery
             return ['outcome' => 'out_of_stock', 'code' => null, 'error' => 'out_of_stock'];
         }
 
+        // A complete 4xx/5xx answer is a refusal we can trust: the supplier told us it did
+        // nothing, so falling back to the other one cannot double-issue.
         return [
             'outcome' => 'failed',
             'code' => null,

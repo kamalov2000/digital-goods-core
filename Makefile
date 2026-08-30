@@ -16,10 +16,12 @@ seed:
 serve:
 	php -S localhost:8000 -t public
 
-# supplier A on 9001, supplier B on 9002; both talk to the same postgres
+# supplier A on 9001, supplier B on 9002; both talk to the same postgres.
+# PHP_CLI_SERVER_WORKERS matters here: a stub hanging on an injected timeout must not
+# block the retry queued behind it (POSIX only, ignored on Windows).
 suppliers:
-	SUPPLIER_NAME=A php -S localhost:9001 suppliers/supplier.php & \
-	SUPPLIER_NAME=B php -S localhost:9002 suppliers/supplier.php & \
+	SUPPLIER_NAME=A PHP_CLI_SERVER_WORKERS=8 php -S localhost:9001 suppliers/supplier.php & \
+	SUPPLIER_NAME=B PHP_CLI_SERVER_WORKERS=8 php -S localhost:9002 suppliers/supplier.php & \
 	wait
 
 worker:
