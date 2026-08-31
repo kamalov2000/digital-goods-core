@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
+use App\Env;
 use App\Http;
 use App\Log;
 use App\Orders;
 use App\Payments;
+use App\Reconcile;
 use App\Router;
 
 $router = new Router();
@@ -68,6 +70,14 @@ $router->add('POST', '/webhook/payment', function (): void {
     }
 
     Http::json(['status' => 'ok', 'result' => $result['status']], $result['code']);
+});
+
+$router->add('GET', '/api/admin/reconcile', function (): void {
+    $stale = isset($_GET['stale_minutes'])
+        ? max(0, (int) $_GET['stale_minutes'])
+        : Env::int('RECONCILE_STALE_MIN', 5);
+
+    Http::json(Reconcile::report($stale));
 });
 
 $router->add('GET', '/health', function (): void {

@@ -23,7 +23,12 @@ final class Orders
             [$id, $product['sku'], $product['price'], $product['currency'], 'created'],
         );
 
-        Log::info('order created', ['order_id' => $id, 'sku' => $sku, 'amount' => (int) $product['price']]);
+        Log::info('order.create', [
+            'order_id' => $id,
+            'result' => 'created',
+            'sku' => $sku,
+            'amount' => (int) $product['price'],
+        ]);
 
         return self::get($id);
     }
@@ -56,7 +61,7 @@ final class Orders
         )->rowCount();
 
         if ($moved === 1) {
-            Log::info('order status changed', ['order_id' => $id, 'from' => $from, 'to' => $to]);
+            Log::info('order.transition', ['order_id' => $id, 'result' => $to, 'from' => $from]);
         }
 
         return $moved === 1;
