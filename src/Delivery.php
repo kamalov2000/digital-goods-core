@@ -41,20 +41,108 @@ final class Delivery
     }
 
     /**
+     * Worker duty #3: orders that stalled in a recoverable status.
+     *
+     * Only orders that have been sitting still for RECOVERY_DELAY_SEC are picked up, which
+     * doubles as the backoff: a recovery pass that fails bumps updated_at, so the same order
+     * is not hammered again for another full delay - handy when the pool is simply empty.
+     *
+     * 'delivering' is in the list because a worker killed mid-call leaves an order there with
+     * nothing to move it on. Picking it up is safe even if that worker is in fact alive: both
+     * would call the SAME deterministic request_id, and the supplier answers a repeated
+     * request_id with the code it already issued. Keep RECOVERY_DELAY_SEC comfortably above
+     * the worst-case delivery time anyway, so this stays a rare path.
+     */
+    public static function runRecovery(int $limit): int
+    {
+        $stuck = Db::all(
+            "SELECT id, status FROM orders
+             WHERE status IN ('delivery_failed', 'out_of_stock', 'delivering')
+               AND updated_at < now() - make_interval(secs => ?)
+             ORDER BY updated_at
+             LIMIT ?",
+            [Env::int('RECOVERY_DELAY_SEC', 30), $limit],
+        );
+
+        $done = 0;
+        foreach ($stuck as $row) {
+            $orderId = (string) $row['id'];
+
+            // Same claim as everywhere else: a conditional UPDATE out of the exact status we
+            // read. Two workers scanning the same batch cannot both take the order.
+            if (!Orders::transition($orderId, (string) $row['status'], 'delivering')) {
+                continue;
+            }
+
+            Log::info('recovery.claim', [
+                'order_id' => $orderId,
+                'result' => 'claimed',
+                'from' => $row['status'],
+            ]);
+
+            self::issue($orderId);
+            $done++;
+        }
+
+        return $done;
+    }
+
+    /**
      * Drives one order from paid to a terminal-ish status: delivered, out_of_stock or
-     * delivery_failed. Tries supplier A, falls back to B, and never gives one order two codes.
+     * delivery_failed.
      */
     public static function deliver(string $orderId): string
     {
         // paid -> delivering is the delivery lock: whoever wins it owns the issue attempt
         if (!Orders::transition($orderId, 'paid', 'delivering')) {
-            Log::info('delivery skipped, order not paid', ['order_id' => $orderId]);
+            Log::info('delivery.claim', ['order_id' => $orderId, 'result' => 'not_paid']);
 
             return 'not_paid';
         }
 
+        return self::issue($orderId);
+    }
+
+    /**
+     * Issues a code for an order this process has already claimed into 'delivering'.
+     * Tries supplier A, falls back to B, and never gives one order two codes.
+     */
+    private static function issue(string $orderId): string
+    {
         $order = Db::one('SELECT id, sku FROM orders WHERE id = ?', [$orderId]);
         $sku = (string) $order['sku'];
+
+        // An unresolved attempt owns this order. That supplier may already be holding a code
+        // for it, so the only safe move is to replay ITS request_id - never to start a fresh
+        // A -> B cycle, which is how a recovery pass would hand out a second key. attempt()
+        // reads the sticky 'unknown' back from the row, so a refusal here cannot release us
+        // to the other supplier either.
+        $unresolved = Db::one(
+            "SELECT supplier FROM issue_requests
+             WHERE order_id = ? AND status = 'unknown'
+             ORDER BY updated_at
+             LIMIT 1",
+            [$orderId],
+        );
+
+        if ($unresolved !== null) {
+            $supplier = (string) $unresolved['supplier'];
+            $resumed = self::attempt($supplier, $orderId, $sku);
+
+            if ($resumed['outcome'] === 'issued') {
+                return self::finish($orderId, self::requestId($orderId, $supplier), (string) $resumed['code']);
+            }
+
+            Orders::transition($orderId, 'delivering', 'delivery_failed');
+            Log::error('delivery.finish', [
+                'order_id' => $orderId,
+                'request_id' => self::requestId($orderId, $supplier),
+                'result' => 'delivery_failed',
+                'reason' => 'still_unresolved',
+            ]);
+
+            return 'delivery_failed';
+        }
 
         $a = self::attempt('A', $orderId, $sku);
         if ($a['outcome'] === 'issued') {
@@ -72,17 +160,17 @@ final class Delivery
         // supplier answers with the code it already issued.
         if ($a['outcome'] === 'unknown') {
             Orders::transition($orderId, 'delivering', 'delivery_failed');
-            Log::error('delivery unresolved, not falling back', [
+            Log::error('delivery.finish', [
                 'order_id' => $orderId,
-                'supplier' => 'A',
-                'outcome' => 'unknown',
-                'error' => $a['error'],
+                'request_id' => self::requestId($orderId, 'A'),
+                'result' => 'delivery_failed',
+                'reason' => 'supplier_a_unresolved',
             ]);
 
             return 'delivery_failed';
         }
 
-        Log::info('falling back to supplier B', ['order_id' => $orderId, 'reason' => $a['outcome']]);
+        Log::info('delivery.fallback', ['order_id' => $orderId, 'result' => 'to_b', 'reason' => $a['outcome']]);
 
         $b = self::attempt('B', $orderId, $sku);
         if ($b['outcome'] === 'issued') {
@@ -95,11 +183,11 @@ final class Delivery
             : 'delivery_failed';
 
         Orders::transition($orderId, 'delivering', $target);
-        Log::error('delivery failed on both suppliers', [
+        Log::error('delivery.finish', [
             'order_id' => $orderId,
+            'result' => $target,
             'supplier_a' => $a['outcome'],
             'supplier_b' => $b['outcome'],
-            'status' => $target,
         ]);
 
         return $target;
@@ -129,11 +217,12 @@ final class Delivery
 
             $result = self::callSupplier($supplier, $requestId, $orderId, $sku);
 
-            Log::info('supplier attempt', [
+            Log::info('supplier.call', [
                 'order_id' => $orderId,
                 'request_id' => $requestId,
+                'result' => $result['outcome'],
+                'supplier' => $supplier,
                 'attempt' => $attempt,
-                'outcome' => $result['outcome'],
                 'error' => $result['error'],
             ]);
 
@@ -210,7 +299,7 @@ final class Delivery
 
         $pdo->commit();
 
-        Log::info('code delivered', ['order_id' => $orderId, 'request_id' => $requestId]);
+        Log::info('delivery.finish', ['order_id' => $orderId, 'request_id' => $requestId, 'result' => 'delivered']);
 
         return 'delivered';
     }

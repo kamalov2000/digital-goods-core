@@ -1,4 +1,4 @@
-.PHONY: up down migrate seed serve suppliers worker test race chaos
+.PHONY: up down migrate seed seed-load serve suppliers worker test race chaos recover bench-catalog reconcile ledger-check
 
 up:
 	docker compose up -d
@@ -12,6 +12,15 @@ migrate:
 
 seed:
 	php bin/seed.php
+
+seed-load:
+	php bin/seed_load.php
+
+reconcile:
+	php bin/reconcile.php
+
+ledger-check:
+	php bin/ledger_check.php
 
 serve:
 	php -S localhost:8000 -t public
@@ -40,3 +49,13 @@ race:
 chaos:
 	docker compose up -d postgres
 	docker compose run --rm --build runner bash tests/chaos.sh
+
+# stage 4: chaos residue -> recovery -> every order delivered, ledger and reconcile clean
+recover:
+	docker compose up -d postgres
+	docker compose run --rm --build runner bash tests/recover.sh
+
+# stage 5: 5000 skus / 200k keys, query plans and storefront latency
+bench-catalog:
+	docker compose up -d postgres
+	docker compose run --rm --build runner bash tests/bench_catalog.sh

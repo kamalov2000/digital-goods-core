@@ -21,7 +21,7 @@ final class Payments
         $status = isset($payload['status']) ? (string) $payload['status'] : '';
 
         if ($eventId === '' || $orderId === '' || !in_array($status, ['paid', 'failed'], true)) {
-            Log::error('webhook rejected', ['event_id' => $eventId, 'order_id' => $orderId, 'reason' => 'bad_payload']);
+            Log::error('payment.webhook', ['order_id' => $orderId, 'event_id' => $eventId, 'result' => 'bad_payload']);
 
             return ['status' => 'bad_request', 'code' => 400];
         }
@@ -42,12 +42,17 @@ final class Payments
         // ON CONFLICT DO NOTHING inserted nothing => this event_id was already accepted.
         // Answer 200 immediately: a redelivery must never re-run the side effects.
         if ($inserted === 0) {
-            Log::info('webhook duplicate ignored', ['event_id' => $eventId, 'order_id' => $orderId]);
+            Log::info('payment.webhook', ['order_id' => $orderId, 'event_id' => $eventId, 'result' => 'duplicate']);
 
             return ['status' => 'duplicate', 'code' => 200];
         }
 
-        Log::info('webhook accepted', ['event_id' => $eventId, 'order_id' => $orderId, 'payment_status' => $status]);
+        Log::info('payment.webhook', [
+            'order_id' => $orderId,
+            'event_id' => $eventId,
+            'result' => 'accepted',
+            'payment_status' => $status,
+        ]);
 
         return ['status' => self::apply($eventId), 'code' => 200];
     }
@@ -78,7 +83,7 @@ final class Payments
             return 'already_applied';
         }
 
-        $event = Db::one('SELECT order_id, status FROM payment_events WHERE event_id = ?', [$eventId]);
+        $event = Db::one('SELECT order_id, status, amount FROM payment_events WHERE event_id = ?', [$eventId]);
         $orderId = (string) $event['order_id'];
         $target = $event['status'] === 'paid' ? 'paid' : 'payment_failed';
 
@@ -89,7 +94,7 @@ final class Payments
             // worker retries later; the reason is recorded outside the transaction.
             $pdo->rollBack();
             Db::run('UPDATE payment_events SET result = ? WHERE event_id = ?', ['order_missing', $eventId]);
-            Log::info('webhook ahead of order, left pending', ['event_id' => $eventId, 'order_id' => $orderId]);
+            Log::info('payment.apply', ['order_id' => $orderId, 'event_id' => $eventId, 'result' => 'order_missing']);
 
             return 'order_missing';
         }
@@ -106,7 +111,26 @@ final class Payments
         $result = $moved ? 'applied' : 'ignored';
         Db::run('UPDATE payment_events SET result = ? WHERE event_id = ?', [$result, $eventId]);
 
+        // The only real money fact this domain has: the gateway confirmed a payment. It is
+        // written in the same transaction that moved the order, so the journal can never
+        // disagree with the order status. UNIQUE (order_id, type, ref) makes the write
+        // idempotent - a replayed event_id cannot book the same money twice.
+        if ($moved && $target === 'paid') {
+            Db::run(
+                'INSERT INTO ledger (order_id, type, amount, ref) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (order_id, type, ref) DO NOTHING',
+                [$orderId, 'payment_received', (int) $event['amount'], $eventId],
+            );
+        }
+
         $pdo->commit();
+
+        Log::info('payment.apply', [
+            'order_id' => $orderId,
+            'event_id' => $eventId,
+            'result' => $result,
+            'order_status' => $moved ? $target : null,
+        ]);
 
         return $result;
     }
@@ -119,7 +143,7 @@ final class Payments
     public static function applyPending(int $limit): int
     {
         $pending = Db::all(
-            'SELECT e.event_id FROM payment_events e
+            'SELECT e.event_id, e.order_id FROM payment_events e
              JOIN orders o ON o.id = e.order_id
              WHERE e.applied = false
              ORDER BY e.received_at
@@ -134,7 +158,11 @@ final class Payments
             // order_missing does not count as progress, otherwise an event whose order never
             // arrives would keep the loop from ever sleeping
             if ($result === 'applied' || $result === 'ignored') {
-                Log::info('pending event applied', ['event_id' => $row['event_id'], 'result' => $result]);
+                Log::info('payment.apply_pending', [
+                    'order_id' => $row['order_id'],
+                    'event_id' => $row['event_id'],
+                    'result' => $result,
+                ]);
                 $done++;
             }
         }
