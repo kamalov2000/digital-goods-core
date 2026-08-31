@@ -51,12 +51,24 @@ final class Reconcile
              LIMIT 500",
         );
 
+        // Materialised stock counter vs the pool it is supposed to mirror (stage 5). A counter
+        // that can drift silently is worse than no counter, so the drift is reported here.
+        $stockDrift = Db::all(
+            'SELECT s.sku, s.available AS counter, count(k.code) AS actual
+             FROM stock s
+             LEFT JOIN key_pool k ON k.sku = s.sku AND k.order_id IS NULL
+             GROUP BY s.sku, s.available
+             HAVING s.available <> count(k.code)
+             LIMIT 500',
+        );
+
         return [
             'generated_at' => gmdate('c'),
             'stale_after_minutes' => $staleMinutes,
             'paid_not_delivered' => ['count' => count($paidNotDelivered), 'orders' => $paidNotDelivered],
             'delivered_not_paid' => ['count' => count($deliveredNotPaid), 'orders' => $deliveredNotPaid],
             'orphaned_keys' => ['count' => count($orphanedKeys), 'keys' => $orphanedKeys],
+            'stock_drift' => ['count' => count($stockDrift), 'skus' => $stockDrift],
         ];
     }
 

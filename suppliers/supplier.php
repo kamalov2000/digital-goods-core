@@ -121,7 +121,7 @@ $stmt = $pdo->prepare(
          WHERE order_id IS NULL AND (sku IS NULL OR sku = ?)
          LIMIT 1 FOR UPDATE SKIP LOCKED
      )
-     RETURNING code'
+     RETURNING code, sku'
 );
 $stmt->execute([$orderId, $sku]);
 $reserved = $stmt->fetch();
@@ -139,6 +139,16 @@ if ($reserved === false) {
 $code = (string) $reserved['code'];
 $stmt = $pdo->prepare('UPDATE supplier_issues SET code = ? WHERE request_id = ?');
 $stmt->execute([$code, $requestId]);
+
+// Storefront counter, decremented in the SAME transaction that took the key out of the pool.
+// That is the only reason it can be trusted: there is no window where the key is reserved but
+// the counter still advertises it. Generic keys (sku NULL) are not counted per sku - see
+// migrations/005_stock.sql.
+if ($reserved['sku'] !== null) {
+    $stmt = $pdo->prepare('UPDATE stock SET available = available - 1, updated_at = now() WHERE sku = ?');
+    $stmt->execute([$reserved['sku']]);
+}
+
 $pdo->commit();
 
 supplier_log('issued code', ['supplier' => $supplier, 'request_id' => $requestId, 'order_id' => $orderId]);

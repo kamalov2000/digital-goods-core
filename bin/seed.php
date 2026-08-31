@@ -5,6 +5,7 @@ declare(strict_types=1);
 require __DIR__ . '/../vendor/autoload.php';
 
 use App\Db;
+use App\Stock;
 
 // Catalog and key pool copied verbatim from the assignment.
 $products = [
@@ -51,6 +52,9 @@ foreach ($products as [$sku, $name, $type, $price, $currency, $image]) {
 foreach ($keys as $code) {
     Db::run('INSERT INTO key_pool (code) VALUES (?) ON CONFLICT (code) DO NOTHING', [$code]);
 }
+
+// keys just added to the pool have to show up in the storefront counter
+Stock::recompute();
 
 $pdo->commit();
 

@@ -10,6 +10,7 @@ declare(strict_types=1);
 require __DIR__ . '/../vendor/autoload.php';
 
 use App\Db;
+use App\Stock;
 
 $pdo = Db::pdo();
 $pdo->beginTransaction();
@@ -17,6 +18,7 @@ $pdo->beginTransaction();
 Db::run('TRUNCATE supplier_issues, issue_requests, payment_events, ledger');
 Db::run('UPDATE key_pool SET order_id = NULL, reserved_at = NULL WHERE order_id IS NOT NULL');
 Db::run('DELETE FROM orders');
+Stock::recompute();
 
 $pdo->commit();
 

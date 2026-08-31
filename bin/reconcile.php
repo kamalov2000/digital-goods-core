@@ -7,8 +7,8 @@ declare(strict_types=1);
  *
  *   php bin/reconcile.php [--stale-minutes=N]
  *
- * Exits 1 if anything that must be empty is not: "delivered but not paid" or ledger
- * discrepancies. "Paid but not delivered" is reported, not failed on -
+ * Exits 1 if anything that must be empty is not: "delivered but not paid", ledger
+ * discrepancies, or stock counter drift. "Paid but not delivered" is reported, not failed on -
  * orders legitimately sit there until recovery gets to them.
  */
 
@@ -31,6 +31,7 @@ $report['ledger_without_payment'] = Reconcile::ledgerWithoutPayment();
 echo json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), PHP_EOL;
 
 $broken = $report['delivered_not_paid']['count']
+    + $report['stock_drift']['count']
     + count($report['ledger_discrepancies'])
     + count($report['ledger_without_payment']);
 

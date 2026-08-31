@@ -228,7 +228,7 @@ else
     echo "  FAIL  reconcile reported a broken invariant"; cat /tmp/reconcile.json; FAILURES=$((FAILURES + 1))
 fi
 php -r '$d = json_decode(file_get_contents("/tmp/reconcile.json"), true);
-    foreach (["paid_not_delivered", "delivered_not_paid", "orphaned_keys"] as $k) {
+    foreach (["paid_not_delivered", "delivered_not_paid", "orphaned_keys", "stock_drift"] as $k) {
         printf("  ..    %-58s = %d\n", $k, $d[$k]["count"]);
     }'
 
