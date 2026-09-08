@@ -30,25 +30,26 @@ final class Reconcile
         // ever issued from 'delivering', which is only reachable from 'paid', which only an
         // applied payment event can produce. Anything here means the invariant broke.
         $deliveredNotPaid = Db::all(
-            "SELECT o.id, o.status, r.code, r.supplier
-             FROM orders o
-             JOIN issue_requests r ON r.order_id = o.id AND r.status = 'issued'
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM payment_events e
-                 WHERE e.order_id = o.id AND e.status = 'paid' AND e.applied AND e.result = 'applied'
-             )
+            "SELECT i.order_id, i.id AS item_id, i.code, i.supplier
+             FROM order_items i
+             WHERE i.status = 'delivered'
+               AND NOT EXISTS (
+                   SELECT 1 FROM payment_events e
+                   WHERE e.order_id = i.order_id AND e.status = 'paid'
+                     AND e.applied AND e.result = 'applied'
+               )
              LIMIT 500",
         );
 
         // Keys that left the pool for an order that never got delivered - the residue of a
         // supplier call whose answer was lost. Recovery clears these by replaying request_id.
         $orphanedKeys = Db::all(
-            "SELECT k.code, k.order_id, o.status
+            'SELECT k.code, k.order_id, k.reserved_at
              FROM key_pool k
-             JOIN orders o ON o.id = k.order_id
-             WHERE o.status <> 'delivered'
+             WHERE k.order_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM order_items i WHERE i.code = k.code)
              ORDER BY k.reserved_at
-             LIMIT 500",
+             LIMIT 500',
         );
 
         // Materialised stock counter vs the pool it is supposed to mirror (stage 5). A counter
@@ -73,9 +74,9 @@ final class Reconcile
     }
 
     /**
-     * Every order that was paid must carry ledger entries summing to exactly its amount.
-     * The comparison has teeth because the ledger stores the amount the gateway reported,
-     * not the order's own amount.
+     * The identity behind task 1: for every order that reached a final state,
+     * paid = delivered + refunded. The comparison has teeth because the journal stores the
+     * amount the gateway reported, not the order's own amount.
      *
      * @return list<array<string, mixed>>
      */
@@ -83,12 +84,16 @@ final class Reconcile
     {
         return Db::all(
             "SELECT o.id, o.status, o.amount AS order_amount,
-                    COALESCE(sum(l.amount), 0) AS ledger_amount
+                    COALESCE(sum(l.amount) FILTER (WHERE l.type = 'payment_received'), 0) AS paid,
+                    COALESCE(sum(l.amount) FILTER (WHERE l.type = 'revenue_recognised'), 0) AS delivered,
+                    COALESCE(sum(l.amount) FILTER (WHERE l.type = 'refund_issued'), 0) AS refunded
              FROM orders o
              LEFT JOIN ledger l ON l.order_id = o.id
-             WHERE o.status NOT IN ('created', 'payment_failed')
+             WHERE o.status IN ('delivered', 'partially_delivered', 'refunded')
              GROUP BY o.id, o.status, o.amount
-             HAVING COALESCE(sum(l.amount), 0) <> o.amount
+             HAVING COALESCE(sum(l.amount) FILTER (WHERE l.type = 'payment_received'), 0)
+                 <> COALESCE(sum(l.amount) FILTER (WHERE l.type = 'revenue_recognised'), 0)
+                  + COALESCE(sum(l.amount) FILTER (WHERE l.type = 'refund_issued'), 0)
              LIMIT 500",
         );
     }

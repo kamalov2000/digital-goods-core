@@ -86,10 +86,19 @@ final class Stage1SmokeTest extends TestCase
         self::assertCount(1, $reserved);
         self::assertSame($order['code'], $reserved[0]['code']);
 
-        $requests = Db::all('SELECT request_id, status FROM issue_requests WHERE order_id = ?', [$orderId]);
+        $requests = Db::all(
+            'SELECT r.request_id, r.status, r.item_id, r.supplier FROM issue_requests r WHERE r.order_id = ?',
+            [$orderId],
+        );
         self::assertCount(1, $requests);
-        self::assertSame('req_' . $orderId . '_A', $requests[0]['request_id']);
         self::assertSame('issued', $requests[0]['status']);
+
+        // request_id is keyed by the line item, which is what makes a retry replayable per line
+        $item = Db::one('SELECT id FROM order_items WHERE order_id = ?', [$orderId]);
+        self::assertSame(
+            'req_' . $item['id'] . '_' . $requests[0]['supplier'],
+            $requests[0]['request_id'],
+        );
     }
 
     public function testRepeatedEventIdChangesNothing(): void

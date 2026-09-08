@@ -7,7 +7,7 @@ declare(strict_types=1);
  *
  *   php bin/ledger_check.php
  *
- * For every order that was paid, the ledger entries must sum to exactly the order amount.
+ * For every order that reached a final state: paid = delivered + refunded.
  * Exits 1 on any discrepancy.
  */
 
@@ -19,20 +19,32 @@ use App\Reconcile;
 $discrepancies = Reconcile::ledgerDiscrepancies();
 $stray = Reconcile::ledgerWithoutPayment();
 
+// Totals over finished orders only: an order still in flight has money in and nothing
+// settled yet, so its lines legitimately do not add up.
 $totals = Db::one(
     "SELECT (SELECT count(*) FROM ledger) AS entries,
-            (SELECT COALESCE(sum(amount), 0) FROM ledger) AS ledger_total,
-            (SELECT COALESCE(sum(amount), 0) FROM orders
-             WHERE status NOT IN ('created', 'payment_failed')) AS orders_total"
+            COALESCE(sum(l.amount) FILTER (WHERE l.type = 'payment_received'), 0) AS paid,
+            COALESCE(sum(l.amount) FILTER (WHERE l.type = 'revenue_recognised'), 0) AS delivered,
+            COALESCE(sum(l.amount) FILTER (WHERE l.type = 'refund_issued'), 0) AS refunded
+     FROM ledger l
+     JOIN orders o ON o.id = l.order_id
+     WHERE o.status IN ('delivered', 'partially_delivered', 'refunded')"
 );
+
+$paid = (int) $totals['paid'];
+$delivered = (int) $totals['delivered'];
+$refunded = (int) $totals['refunded'];
 
 echo json_encode([
     'entries' => (int) $totals['entries'],
-    'ledger_total' => (int) $totals['ledger_total'],
-    'paid_orders_total' => (int) $totals['orders_total'],
-    'balanced' => (int) $totals['ledger_total'] === (int) $totals['orders_total'],
+    'final_orders' => [
+        'paid' => $paid,
+        'delivered' => $delivered,
+        'refunded' => $refunded,
+    ],
+    'balanced' => $paid === $delivered + $refunded,
     'orders_not_matching' => $discrepancies,
     'ledger_without_payment' => $stray,
 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
 
-exit($discrepancies === [] && $stray === [] ? 0 : 1);
+exit($discrepancies === [] && $stray === [] && $paid === $delivered + $refunded ? 0 : 1);

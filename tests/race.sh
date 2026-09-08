@@ -157,9 +157,20 @@ check "event marked retryable" order_missing \
     "SELECT result FROM payment_events WHERE event_id = ?" "$EVENT3"
 
 # the creation request the webhook overtook finally lands
+# A real order is a header plus at least one line, so the harness has to create both -
+# a header on its own would leave the worker with nothing to deliver.
 check "order row finally appears" "$ORDER3" \
-    "INSERT INTO orders (id, sku, amount, currency, status)
-     SELECT ?, sku, price, currency, 'created' FROM products WHERE sku = ? RETURNING id" \
+    "WITH o AS (
+         INSERT INTO orders (id, sku, amount, currency, status)
+         SELECT ?, p.sku, p.price, p.currency, 'created' FROM products p WHERE p.sku = ?
+         RETURNING id, sku, amount, currency
+     ), i AS (
+         INSERT INTO order_items (id, order_id, sku, amount, currency, supplier, status)
+         SELECT 'itm_' || substr(md5(o.id), 1, 16), o.id, o.sku, o.amount, o.currency,
+                (SELECT supplier FROM products WHERE sku = o.sku), 'pending'
+         FROM o RETURNING order_id
+     )
+     SELECT id FROM o" \
     "$ORDER3" KEY-EFT
 
 start_worker

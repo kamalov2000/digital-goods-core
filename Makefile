@@ -1,4 +1,4 @@
-.PHONY: up down migrate seed seed-load serve suppliers worker test race chaos recover bench-catalog reconcile ledger-check
+.PHONY: up down migrate seed seed-load serve suppliers worker test race chaos recover partial bench-catalog reconcile ledger-check
 
 up:
 	docker compose up -d
@@ -54,6 +54,11 @@ chaos:
 recover:
 	docker compose up -d postgres
 	docker compose run --rm --build runner bash tests/recover.sh
+
+# stage 2 task 1: basket with partial fulfilment, refunds and the money identity
+partial:
+	docker compose up -d postgres
+	docker compose run --rm --build runner bash tests/partial.sh
 
 # stage 5: 5000 skus / 200k keys, query plans and storefront latency
 bench-catalog:

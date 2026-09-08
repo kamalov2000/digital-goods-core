@@ -209,8 +209,8 @@ check "no delivered order without a code" 0 \
     "SELECT count(*) FROM orders o WHERE o.status = 'delivered'
      AND NOT EXISTS (SELECT 1 FROM issue_requests r
                      WHERE r.order_id = o.id AND r.status = 'issued' AND r.code IS NOT NULL)"
-check "exactly one ledger entry per order" "$ORDER_COUNT" \
-    "SELECT count(*) FROM ledger"
+check "exactly one payment booked per order" "$ORDER_COUNT" \
+    "SELECT count(*) FROM ledger WHERE type = 'payment_received'"
 
 # ---------------------------------------------------------------------------
 echo
@@ -220,7 +220,7 @@ if php bin/ledger_check.php > /tmp/ledger.json; then
 else
     echo "  FAIL  ledger_check reported discrepancies"; cat /tmp/ledger.json; FAILURES=$((FAILURES + 1))
 fi
-php -r '$d = json_decode(file_get_contents("/tmp/ledger.json"), true); printf("  ..    %-58s = %s\n", "ledger total vs paid orders total", $d["ledger_total"] . " / " . $d["paid_orders_total"]);'
+php -r '$d = json_decode(file_get_contents("/tmp/ledger.json"), true); printf("  ..    %-58s = %d / %d + %d\n", "paid / delivered + refunded", $d["final_orders"]["paid"], $d["final_orders"]["delivered"], $d["final_orders"]["refunded"]);'
 
 if php bin/reconcile.php --stale-minutes=0 > /tmp/reconcile.json; then
     echo "  PASS  reconcile clean (exit 0)"

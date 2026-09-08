@@ -15,7 +15,7 @@ use App\Stock;
 $pdo = Db::pdo();
 $pdo->beginTransaction();
 
-Db::run('TRUNCATE supplier_issues, issue_requests, payment_events, ledger');
+Db::run('TRUNCATE supplier_issues, issue_requests, order_items, payment_events, ledger');
 Db::run('UPDATE key_pool SET order_id = NULL, reserved_at = NULL WHERE order_id IS NOT NULL');
 Db::run('DELETE FROM orders');
 Stock::recompute();

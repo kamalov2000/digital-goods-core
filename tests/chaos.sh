@@ -123,6 +123,15 @@ wait_for_terminal() {
     return 1
 }
 
+# Which supplier owns a product is decided by the seed, and every case below injects its faults
+# into supplier A - so the skus have to be ones whose primary supplier really is A. Resolving
+# them here instead of hardcoding names keeps the test honest if the catalogue is reshuffled.
+pick_sku() {
+    php -r 'require "vendor/autoload.php";
+        echo App\Db::one("SELECT sku FROM products WHERE supplier = ? AND sku NOT LIKE ? ORDER BY sku OFFSET ? LIMIT 1",
+            ["A", "LOAD-%", (int) $argv[1]])["sku"];' "$1"
+}
+
 echo "=== setup ==="
 [ -f vendor/autoload.php ] || composer install --no-interaction --quiet
 php bin/migrate.php
@@ -134,11 +143,15 @@ APP_PID=$!
 for _ in $(seq 1 60); do curl -sf "$APP_URL/health" >/dev/null && break; sleep 0.25; done
 echo "app up"
 
+SKU_1=$(pick_sku 0); SKU_2=$(pick_sku 1); SKU_3=$(pick_sku 2)
+SKU_4=$(pick_sku 3); SKU_5=$(pick_sku 4)
+echo "skus with supplier A: $SKU_1 $SKU_2 $SKU_3 $SKU_4 $SKU_5"
+
 # ---------------------------------------------------------------------------
 echo
 echo "=== case 4: A issues, then hangs (criterion 4 - the timeout trap) ==="
 suppliers 0 1.0 0 0
-ORDER4=$(new_order KEY-CS2-PRIME)
+ORDER4=$(new_order "$SKU_1")
 echo "  order $ORDER4"
 php bin/paysim.php "$ORDER4" --status=paid --n=1 >/dev/null
 start_worker
@@ -163,7 +176,7 @@ check "the timeout was retried on the same request_id" 1 \
 echo
 echo "=== case 5: A refuses outright, fallback to B (criterion 5) ==="
 suppliers 1.0 0 0 0
-ORDER5=$(new_order KEY-GTA5)
+ORDER5=$(new_order "$SKU_2")
 echo "  order $ORDER5"
 php bin/paysim.php "$ORDER5" --status=paid --n=1 >/dev/null
 start_worker
@@ -191,7 +204,7 @@ suppliers 0 0 0 0
 php -r 'require "vendor/autoload.php"; App\Db::run("DELETE FROM key_pool WHERE order_id IS NULL");'
 check "pool is empty" 0 "SELECT count(*) FROM key_pool WHERE order_id IS NULL"
 
-ORDER6=$(new_order KEY-EFT)
+ORDER6=$(new_order "$SKU_3")
 echo "  order $ORDER6"
 php bin/paysim.php "$ORDER6" --status=paid --n=1 >/dev/null
 start_worker
@@ -230,7 +243,7 @@ echo "=== case 7: A hangs after issuing, then refuses the retry ==="
 suppliers 0.5 1.0 0 0
 CASE7_IDS=()
 for _ in $(seq 1 6); do
-    OID=$(new_order SUB-SPOTIFY-1M)
+    OID=$(new_order "$SKU_4")
     CASE7_IDS+=("$OID")
     php bin/paysim.php "$OID" --status=paid --n=1 >/dev/null
 done
@@ -241,7 +254,7 @@ done
 stop_worker
 
 check "all 6 orders reached a terminal status" 6 \
-    "SELECT count(*) FROM orders WHERE sku = 'SUB-SPOTIFY-1M'
+    "SELECT count(*) FROM orders WHERE sku = '$SKU_4'
      AND status IN ('delivered', 'out_of_stock', 'delivery_failed')"
 check "no order was issued a code by both suppliers" 0 \
     "SELECT count(*) FROM (SELECT order_id FROM supplier_issues WHERE code IS NOT NULL
@@ -256,7 +269,7 @@ echo "=== chaos: 10 orders, A 0.3/0.3, B 0.2/0.2 ==="
 suppliers 0.3 0.3 0.2 0.2
 CHAOS_IDS=()
 for _ in $(seq 1 10); do
-    OID=$(new_order SUB-YT-3M)
+    OID=$(new_order "$SKU_5")
     CHAOS_IDS+=("$OID")
     php bin/paysim.php "$OID" --status=paid --n=1 >/dev/null
 done
@@ -268,11 +281,11 @@ done
 stop_worker
 
 check "all 10 chaos orders reached a terminal status" 10 \
-    "SELECT count(*) FROM orders WHERE sku = 'SUB-YT-3M'
+    "SELECT count(*) FROM orders WHERE sku = '$SKU_5'
      AND status IN ('delivered', 'out_of_stock', 'delivery_failed')"
 echo "  --- chaos outcome (informational, no assertion) ---"
-note "delivered"       "SELECT count(*) FROM orders WHERE sku = 'SUB-YT-3M' AND status = 'delivered'"
-note "delivery_failed" "SELECT count(*) FROM orders WHERE sku = 'SUB-YT-3M' AND status = 'delivery_failed'"
+note "delivered"       "SELECT count(*) FROM orders WHERE sku = '$SKU_5' AND status = 'delivered'"
+note "delivery_failed" "SELECT count(*) FROM orders WHERE sku = '$SKU_5' AND status = 'delivery_failed'"
 note "fell back to B"  "SELECT count(*) FROM issue_requests WHERE supplier = 'B'"
 note "unresolved (unknown) attempts" "SELECT count(*) FROM issue_requests WHERE status = 'unknown'"
 note "orphaned keys (issued, order not delivered)" \
