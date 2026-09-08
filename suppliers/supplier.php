@@ -7,16 +7,29 @@ declare(strict_types=1);
  *   SUPPLIER_NAME=A php -S localhost:9001 suppliers/supplier.php
  *   SUPPLIER_NAME=B php -S localhost:9002 suppliers/supplier.php
  *
- * It stands in for an external system, so it keeps its own PDO connection and its own
- * tables (supplier_issues, key_pool) and shares nothing with the shop core but config.
+ * It stands in for an external system, so it keeps its own PDO connection and its own tables
+ * (supplier_issues, key_pool) and shares nothing with the shop core but config.
+ *
+ * Two endpoints:
+ *   POST /issue                 ask for a code
+ *   GET  /issue/{request_id}    ask what was issued for that request_id
+ *
+ * The GET is the honest half of a dishonest supplier: even a system that lies in its answers
+ * still knows what it did, and that is what lets the client resolve "you answered with an
+ * error but you did issue" without gambling on a retry.
  *
  * Fault injection via env (all default to no faults):
- *   FAIL_RATE    - probability of answering 5xx BEFORE anything is issued
- *   TIMEOUT_RATE - probability of hanging AFTER the code is committed
- *   TIMEOUT_SEC  - how long the hang lasts; set it above the client timeout
+ *   FAIL_RATE             answer 5xx BEFORE anything is issued
+ *   TIMEOUT_RATE          hang for TIMEOUT_SEC AFTER the code is committed
+ *   TIMEOUT_SEC           how long the hang lasts; set it above the client timeout
+ *   ERROR_AFTER_ISSUE_RATE  reserve and commit the key, then answer 5xx anyway
+ *   DUPLICATE_RATE        answer with a code that was already issued to someone else
+ *   FOREIGN_CODE_RATE     answer with a code that was never in this pool at all
  *
- * The order of those two is the whole point of stage 3: a failure is injected before any
- * side effect, a timeout only after one. That is what makes "timeout != refusal" real.
+ * The ordering is the whole point. FAIL_RATE fires before any side effect, so it is a refusal
+ * the client may trust. DUPLICATE and FOREIGN reserve nothing, so they burn no key. TIMEOUT and
+ * ERROR_AFTER_ISSUE fire only after the key is committed, which is exactly the case where the
+ * client must not believe the answer.
  */
 
 require __DIR__ . '/../vendor/autoload.php';
@@ -38,8 +51,48 @@ function supplier_reply(int $status, array $body): void
     echo json_encode($body, JSON_UNESCAPED_SLASHES);
 }
 
+function supplier_pdo(): PDO
+{
+    return new PDO(
+        sprintf(
+            'pgsql:host=%s;port=%d;dbname=%s',
+            Env::get('DB_HOST', '127.0.0.1'),
+            Env::int('DB_PORT', 5432),
+            Env::get('DB_NAME', 'shop'),
+        ),
+        Env::get('DB_USER', 'shop'),
+        Env::get('DB_PASS', 'shop'),
+        [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ],
+    );
+}
+
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
-if ($path !== '/issue' || ($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+$method = $_SERVER['REQUEST_METHOD'] ?? '';
+
+// ---------------------------------------------------------------------------
+// GET /issue/{request_id} - what do you think you issued for this request?
+if ($method === 'GET' && preg_match('#^/issue/(?P<id>[^/]+)$#', (string) $path, $m) === 1) {
+    $stmt = supplier_pdo()->prepare('SELECT code FROM supplier_issues WHERE request_id = ?');
+    $stmt->execute([$m['id']]);
+    $row = $stmt->fetch();
+
+    if ($row === false || $row['code'] === null) {
+        supplier_reply(200, ['status' => 'none', 'request_id' => $m['id']]);
+
+        return true;
+    }
+
+    supplier_log('confirmed issue', ['supplier' => $supplier, 'request_id' => $m['id']]);
+    supplier_reply(200, ['status' => 'ok', 'request_id' => $m['id'], 'code' => $row['code']]);
+
+    return true;
+}
+
+if ($path !== '/issue' || $method !== 'POST') {
     supplier_reply(404, ['status' => 'error', 'reason' => 'not_found']);
 
     return true;
@@ -62,34 +115,19 @@ if ($requestId === '' || $orderId === '' || $sku === '') {
 $roll = static fn (float $rate): bool => $rate > 0 && (mt_rand() / mt_getrandmax()) < $rate;
 
 if ($roll(Env::float('FAIL_RATE', 0.0))) {
-    // injected before touching the database: nothing was issued, so the client may safely
-    // treat this as a definite refusal and fall back to the other supplier
+    // injected before touching the database: nothing was issued, so the client may safely treat
+    // this as a definite refusal and fall back to the other supplier
     supplier_log('injected failure', ['supplier' => $supplier, 'request_id' => $requestId]);
     supplier_reply(500, ['status' => 'error', 'reason' => 'internal']);
 
     return true;
 }
 
-$pdo = new PDO(
-    sprintf(
-        'pgsql:host=%s;port=%d;dbname=%s',
-        Env::get('DB_HOST', '127.0.0.1'),
-        Env::int('DB_PORT', 5432),
-        Env::get('DB_NAME', 'shop'),
-    ),
-    Env::get('DB_USER', 'shop'),
-    Env::get('DB_PASS', 'shop'),
-    [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
-    ],
-);
-
+$pdo = supplier_pdo();
 $pdo->beginTransaction();
 
-// Claim the request_id first. A concurrent call with the same request_id blocks on the
-// primary key here and, once we commit, falls through to the replay branch below.
+// Claim the request_id first. A concurrent call with the same request_id blocks on the primary
+// key here and, once we commit, falls through to the replay branch below.
 $stmt = $pdo->prepare(
     'INSERT INTO supplier_issues (request_id, supplier, order_id, sku) VALUES (?, ?, ?, ?)
      ON CONFLICT (request_id) DO NOTHING'
@@ -100,9 +138,9 @@ $stmt = $pdo->prepare('SELECT code FROM supplier_issues WHERE request_id = ? FOR
 $stmt->execute([$requestId]);
 $existing = $stmt->fetch();
 
-// Replay: this request_id already has a code. Answer immediately and never inject a fault
-// here - a retry after a timeout must be able to learn what was issued, otherwise the
-// client could never resolve an 'unknown' attempt and would be pushed into a second issue.
+// Replay: this request_id already has a code. Answer immediately and never inject a fault here -
+// a retry after a timeout must be able to learn what was issued, otherwise the client could
+// never resolve an 'unknown' attempt and would be pushed into a second issue.
 if ($existing !== false && $existing['code'] !== null) {
     $pdo->commit();
     supplier_log('replayed issued code', ['supplier' => $supplier, 'request_id' => $requestId]);
@@ -111,9 +149,50 @@ if ($existing !== false && $existing['code'] !== null) {
     return true;
 }
 
+// --- dishonest answers -----------------------------------------------------
+// Both of these reserve nothing and record nothing: the supplier simply says something untrue.
+// That is what makes them detectable on the client side and safe to fall back from.
+
+if ($roll(Env::float('DUPLICATE_RATE', 0.0))) {
+    $stmt = $pdo->prepare(
+        'SELECT code FROM supplier_issues WHERE code IS NOT NULL AND request_id <> ? LIMIT 1'
+    );
+    $stmt->execute([$requestId]);
+    $victim = $stmt->fetch();
+
+    if ($victim !== false) {
+        $pdo->rollBack();
+        supplier_log('injected duplicate code', [
+            'supplier' => $supplier,
+            'request_id' => $requestId,
+            'code' => $victim['code'],
+        ]);
+        supplier_reply(200, ['status' => 'ok', 'request_id' => $requestId, 'code' => $victim['code']]);
+
+        return true;
+    }
+}
+
+if ($roll(Env::float('FOREIGN_CODE_RATE', 0.0))) {
+    $pdo->rollBack();
+    $fake = sprintf(
+        'XXXX-%04X-%04X',
+        random_int(0, 0xFFFF),
+        random_int(0, 0xFFFF),
+    );
+    supplier_log('injected foreign code', [
+        'supplier' => $supplier,
+        'request_id' => $requestId,
+        'code' => $fake,
+    ]);
+    supplier_reply(200, ['status' => 'ok', 'request_id' => $requestId, 'code' => $fake]);
+
+    return true;
+}
+
 // Reserve one free key. SKIP LOCKED lets concurrent issues grab different rows instead of
-// queuing on the same one, and the whole thing is a single statement so no key can be
-// handed out twice.
+// queuing on the same one, and the whole thing is a single statement so no key can be handed
+// out twice.
 $stmt = $pdo->prepare(
     'UPDATE key_pool SET order_id = ?, reserved_at = now()
      WHERE code = (
@@ -127,8 +206,8 @@ $stmt->execute([$orderId, $sku]);
 $reserved = $stmt->fetch();
 
 if ($reserved === false) {
-    // roll back so the request_id is not burned with a NULL code: after a restock the
-    // same request_id can be retried and will get a real key
+    // roll back so the request_id is not burned with a NULL code: after a restock the same
+    // request_id can be retried and will get a real key
     $pdo->rollBack();
     supplier_log('out of stock', ['supplier' => $supplier, 'request_id' => $requestId, 'order_id' => $orderId]);
     supplier_reply(409, ['status' => 'error', 'reason' => 'out_of_stock']);
@@ -152,6 +231,17 @@ if ($reserved['sku'] !== null) {
 $pdo->commit();
 
 supplier_log('issued code', ['supplier' => $supplier, 'request_id' => $requestId, 'order_id' => $orderId]);
+
+// --- faults that fire only after the key is already committed ---------------
+
+if ($roll(Env::float('ERROR_AFTER_ISSUE_RATE', 0.0))) {
+    // The nastiest one: a complete, plausible refusal for a request that succeeded. A client
+    // that believes it will fall back and hand the line a second key.
+    supplier_log('injected error after issuing', ['supplier' => $supplier, 'request_id' => $requestId]);
+    supplier_reply(500, ['status' => 'error', 'reason' => 'internal']);
+
+    return true;
+}
 
 // The key is reserved and supplier_issues is committed at this point. Hanging now is the
 // timeout trap: the client gives up and never learns that the code was already issued.
