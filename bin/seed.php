@@ -39,12 +39,16 @@ $keys = [
 $pdo = Db::pdo();
 $pdo->beginTransaction();
 
-foreach ($products as [$sku, $name, $type, $price, $currency, $image]) {
+// Suppliers alternate down the catalogue, so a basket of several products naturally spans
+// both of them - which is the point of task 1.
+foreach ($products as $i => [$sku, $name, $type, $price, $currency, $image]) {
     Db::run(
-        'INSERT INTO products (sku, name, type, price, currency, image) VALUES (?, ?, ?, ?, ?, ?)
+        'INSERT INTO products (sku, name, type, price, currency, image, supplier)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (sku) DO UPDATE SET name = excluded.name, type = excluded.type,
-             price = excluded.price, currency = excluded.currency, image = excluded.image',
-        [$sku, $name, $type, $price, $currency, $image],
+             price = excluded.price, currency = excluded.currency, image = excluded.image,
+             supplier = excluded.supplier',
+        [$sku, $name, $type, $price, $currency, $image, $i % 2 === 0 ? 'A' : 'B'],
     );
 }
 

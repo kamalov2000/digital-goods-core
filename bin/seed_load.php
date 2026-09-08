@@ -47,14 +47,14 @@ $pdo->beginTransaction();
 $batch = [];
 for ($i = 1; $i <= $skuCount; $i++) {
     $sku = sprintf('LOAD-%05d', $i);
-    $batch[] = [$sku, 'Load test item ' . $i, $types[$i % 4], 100 + ($i % 4900), 'RUB'];
+    $batch[] = [$sku, 'Load test item ' . $i, $types[$i % 4], 100 + ($i % 4900), 'RUB', $i % 2 === 0 ? 'A' : 'B'];
 
     if (count($batch) === 1000) {
-        insertBatch('INSERT INTO products (sku, name, type, price, currency)', 5, $batch);
+        insertBatch('INSERT INTO products (sku, name, type, price, currency, supplier)', 6, $batch);
         $batch = [];
     }
 }
-insertBatch('INSERT INTO products (sku, name, type, price, currency)', 5, $batch);
+insertBatch('INSERT INTO products (sku, name, type, price, currency, supplier)', 6, $batch);
 echo "products: {$skuCount}\n";
 
 $batch = [];
