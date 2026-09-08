@@ -7,32 +7,42 @@ namespace App;
 final class Delivery
 {
     /**
-     * Deterministic request_id. This is the whole timeout trap: a retry of a call that
-     * timed out reuses the identifier, so the supplier replays the code it already issued
-     * instead of pulling a second key out of the pool.
+     * Deterministic request_id, now keyed by the line item. This is the whole timeout trap: a
+     * retry of a call that timed out reuses the identifier, so the supplier replays the code it
+     * already issued instead of pulling a second key out of the pool.
      */
-    public static function requestId(string $orderId, string $supplier): string
+    public static function requestId(string $itemId, string $supplier): string
     {
-        return "req_{$orderId}_{$supplier}";
+        return "req_{$itemId}_{$supplier}";
+    }
+
+    /** The other supplier, used as the fallback for a line. */
+    public static function fallbackOf(string $supplier): string
+    {
+        return $supplier === 'A' ? 'B' : 'A';
     }
 
     /**
-     * Worker duty #1: orders sitting in 'paid' waiting for a code.
+     * Worker duty #1: line items waiting for a code on an order whose money already arrived.
      *
-     * The SELECT is deliberately unlocked - it only nominates candidates. The claim happens
-     * inside deliver(), where the conditional UPDATE paid -> delivering lets exactly one
-     * worker through, so two workers scanning the same batch cannot both call the supplier.
+     * The SELECT is deliberately unlocked - it only nominates candidates. The claim happens in
+     * claim(), where the conditional UPDATE pending -> delivering lets exactly one worker
+     * through, so two workers scanning the same batch cannot both call a supplier for one line.
      */
     public static function runPending(int $limit): int
     {
-        $orders = Db::all(
-            'SELECT id FROM orders WHERE status = ? ORDER BY updated_at LIMIT ?',
-            ['paid', $limit],
+        $items = Db::all(
+            "SELECT i.id FROM order_items i
+             JOIN orders o ON o.id = i.order_id
+             WHERE i.status = 'pending' AND o.status IN ('paid', 'delivering')
+             ORDER BY i.created_at
+             LIMIT ?",
+            [$limit],
         );
 
         $done = 0;
-        foreach ($orders as $row) {
-            if (self::deliver((string) $row['id']) !== 'not_paid') {
+        foreach ($items as $row) {
+            if (self::deliverItem((string) $row['id'])) {
                 $done++;
             }
         }
@@ -41,46 +51,45 @@ final class Delivery
     }
 
     /**
-     * Worker duty #3: orders that stalled in a recoverable status.
+     * Worker duty #3: lines that stalled. Recovery never starts a fresh supplier cycle while an
+     * attempt is unresolved - see issueItem().
      *
-     * Only orders that have been sitting still for RECOVERY_DELAY_SEC are picked up, which
-     * doubles as the backoff: a recovery pass that fails bumps updated_at, so the same order
-     * is not hammered again for another full delay - handy when the pool is simply empty.
-     *
-     * 'delivering' is in the list because a worker killed mid-call leaves an order there with
-     * nothing to move it on. Picking it up is safe even if that worker is in fact alive: both
-     * would call the SAME deterministic request_id, and the supplier answers a repeated
-     * request_id with the code it already issued. Keep RECOVERY_DELAY_SEC comfortably above
-     * the worst-case delivery time anyway, so this stays a rare path.
+     * 'delivering' is in the list because a worker killed mid-call leaves a line there with
+     * nothing to move it on. Reclaiming it is safe even if that worker is alive: both would call
+     * the SAME deterministic request_id, and the supplier answers a repeated request_id with the
+     * code it already issued.
      */
     public static function runRecovery(int $limit): int
     {
         $stuck = Db::all(
-            "SELECT id, status FROM orders
-             WHERE status IN ('delivery_failed', 'out_of_stock', 'delivering')
-               AND updated_at < now() - make_interval(secs => ?)
-             ORDER BY updated_at
+            "SELECT i.id, i.status FROM order_items i
+             JOIN orders o ON o.id = i.order_id
+             WHERE i.status IN ('delivery_failed', 'out_of_stock', 'delivering')
+               AND i.updated_at < now() - make_interval(secs => ?)
+               AND o.status NOT IN ('created', 'payment_failed')
+             ORDER BY i.updated_at
              LIMIT ?",
             [Env::int('RECOVERY_DELAY_SEC', 30), $limit],
         );
 
         $done = 0;
         foreach ($stuck as $row) {
-            $orderId = (string) $row['id'];
+            $itemId = (string) $row['id'];
 
-            // Same claim as everywhere else: a conditional UPDATE out of the exact status we
-            // read. Two workers scanning the same batch cannot both take the order.
-            if (!Orders::transition($orderId, (string) $row['status'], 'delivering')) {
+            if (!Orders::moveItem($itemId, (string) $row['status'], 'delivering')) {
                 continue;
             }
 
             Log::info('recovery.claim', [
-                'order_id' => $orderId,
+                'item_id' => $itemId,
                 'result' => 'claimed',
                 'from' => $row['status'],
             ]);
 
-            self::issue($orderId);
+            // the order may have settled into a failed state while this line was stuck
+            Orders::settle((string) Db::one('SELECT order_id FROM order_items WHERE id = ?', [$itemId])['order_id']);
+
+            self::issueItem($itemId);
             $done++;
         }
 
@@ -88,122 +97,174 @@ final class Delivery
     }
 
     /**
-     * Drives one order from paid to a terminal-ish status: delivered, out_of_stock or
-     * delivery_failed.
+     * Drives every line of one order. Used by the API smoke tests, which want the whole thing to
+     * happen synchronously; the worker uses runPending() instead.
      */
     public static function deliver(string $orderId): string
     {
-        // paid -> delivering is the delivery lock: whoever wins it owns the issue attempt
-        if (!Orders::transition($orderId, 'paid', 'delivering')) {
-            Log::info('delivery.claim', ['order_id' => $orderId, 'result' => 'not_paid']);
+        $items = Db::all('SELECT id FROM order_items WHERE order_id = ? ORDER BY id', [$orderId]);
 
-            return 'not_paid';
+        foreach ($items as $row) {
+            self::deliverItem((string) $row['id']);
         }
 
-        return self::issue($orderId);
+        $order = Db::one('SELECT status FROM orders WHERE id = ?', [$orderId]);
+
+        return (string) $order['status'];
+    }
+
+    /** Claims one line and issues it. Returns false when another worker owned the claim. */
+    private static function deliverItem(string $itemId): bool
+    {
+        if (!Orders::moveItem($itemId, 'pending', 'delivering')) {
+            return false;
+        }
+
+        $item = Db::one('SELECT order_id FROM order_items WHERE id = ?', [$itemId]);
+        $orderId = (string) $item['order_id'];
+
+        // settle() deliberately keeps its hands off the payment path, so the bridge out of
+        // 'paid' is an explicit conditional transition. Whoever claims the first line of the
+        // order wins it; everyone else gets rowCount 0 and moves on.
+        Orders::transition($orderId, 'paid', 'delivering');
+
+        self::issueItem($itemId);
+
+        return true;
     }
 
     /**
-     * Issues a code for an order this process has already claimed into 'delivering'.
-     * Tries supplier A, falls back to B, and never gives one order two codes.
+     * Issues a code for a line this process has already claimed into 'delivering'.
+     * Tries the line's own supplier, falls back to the other, and never gives one line two codes.
      */
-    private static function issue(string $orderId): string
+    private static function issueItem(string $itemId): string
     {
-        $order = Db::one('SELECT id, sku FROM orders WHERE id = ?', [$orderId]);
-        $sku = (string) $order['sku'];
+        $item = Db::one('SELECT id, order_id, sku, supplier FROM order_items WHERE id = ?', [$itemId]);
+        $orderId = (string) $item['order_id'];
+        $sku = (string) $item['sku'];
+        $primary = (string) $item['supplier'];
 
-        // An unresolved attempt owns this order. That supplier may already be holding a code
-        // for it, so the only safe move is to replay ITS request_id - never to start a fresh
-        // A -> B cycle, which is how a recovery pass would hand out a second key. attempt()
-        // reads the sticky 'unknown' back from the row, so a refusal here cannot release us
-        // to the other supplier either.
+        // An unresolved attempt owns this line. That supplier may already be holding a code for
+        // it, so the only safe move is to replay ITS request_id - never to start a fresh cycle,
+        // which is how a recovery pass would hand out a second key. attempt() reads the sticky
+        // 'unknown' back from the row, so a refusal here cannot release us to the other supplier.
         $unresolved = Db::one(
             "SELECT supplier FROM issue_requests
-             WHERE order_id = ? AND status = 'unknown'
-             ORDER BY updated_at
-             LIMIT 1",
-            [$orderId],
+             WHERE item_id = ? AND status = 'unknown'
+             ORDER BY updated_at LIMIT 1",
+            [$itemId],
         );
 
         if ($unresolved !== null) {
             $supplier = (string) $unresolved['supplier'];
-            $resumed = self::attempt($supplier, $orderId, $sku);
+            $resumed = self::attempt($supplier, $itemId, $orderId, $sku);
 
             if ($resumed['outcome'] === 'issued') {
-                return self::finish($orderId, self::requestId($orderId, $supplier), (string) $resumed['code']);
+                return self::finish($itemId, $orderId, $supplier, (string) $resumed['code']);
             }
 
-            Orders::transition($orderId, 'delivering', 'delivery_failed');
-            Log::error('delivery.finish', [
-                'order_id' => $orderId,
-                'request_id' => self::requestId($orderId, $supplier),
-                'result' => 'delivery_failed',
-                'reason' => 'still_unresolved',
-            ]);
-
-            return 'delivery_failed';
+            return self::fail($itemId, $orderId, 'delivery_failed', ['reason' => 'still_unresolved']);
         }
 
-        $a = self::attempt('A', $orderId, $sku);
+        $a = self::attempt($primary, $itemId, $orderId, $sku);
         if ($a['outcome'] === 'issued') {
-            return self::finish($orderId, self::requestId($orderId, 'A'), (string) $a['code']);
+            return self::finish($itemId, $orderId, $primary, (string) $a['code']);
         }
 
-        // THE RULE: no fallback to B while A is 'unknown'.
+        // THE RULE: no fallback while the primary supplier is 'unknown'.
         //
-        // 'unknown' means we never got an answer - the supplier may well have reserved a key
-        // and committed the issue. Asking B now would be asking for a second code for the same
-        // order, and the first one would already be gone from the pool. Only a definite
-        // refusal ('failed') or a definite empty stock ('out_of_stock') releases us to B.
-        // A that ran out of retries while still unknown leaves the order in delivery_failed;
-        // recovery (stage 4) resumes it by replaying the SAME request_id against A, which the
-        // supplier answers with the code it already issued.
+        // 'unknown' means we never got an answer - the supplier may well have reserved a key and
+        // committed the issue. Asking the other one now would be asking for a second code for the
+        // same line, and the first would already be gone from the pool. Only a definite refusal
+        // ('failed') or a definite empty stock ('out_of_stock') releases us. A line that ran out
+        // of retries while still unknown waits for recovery, which replays the SAME request_id.
         if ($a['outcome'] === 'unknown') {
-            Orders::transition($orderId, 'delivering', 'delivery_failed');
-            Log::error('delivery.finish', [
-                'order_id' => $orderId,
-                'request_id' => self::requestId($orderId, 'A'),
-                'result' => 'delivery_failed',
-                'reason' => 'supplier_a_unresolved',
-            ]);
-
-            return 'delivery_failed';
+            return self::fail($itemId, $orderId, 'delivery_failed', ['reason' => 'primary_unresolved']);
         }
 
-        Log::info('delivery.fallback', ['order_id' => $orderId, 'result' => 'to_b', 'reason' => $a['outcome']]);
+        $fallback = self::fallbackOf($primary);
+        Log::info('delivery.fallback', [
+            'order_id' => $orderId,
+            'item_id' => $itemId,
+            'result' => 'to_' . strtolower($fallback),
+            'reason' => $a['outcome'],
+        ]);
 
-        $b = self::attempt('B', $orderId, $sku);
+        $b = self::attempt($fallback, $itemId, $orderId, $sku);
         if ($b['outcome'] === 'issued') {
-            return self::finish($orderId, self::requestId($orderId, 'B'), (string) $b['code']);
+            return self::finish($itemId, $orderId, $fallback, (string) $b['code']);
         }
 
-        // Both empty is a stock problem, not an integration failure: recoverable by restocking.
+        // Both empty is a stock problem, not an integration failure: recoverable by restocking,
+        // and refundable once the refund deadline passes.
         $target = $a['outcome'] === 'out_of_stock' && $b['outcome'] === 'out_of_stock'
             ? 'out_of_stock'
             : 'delivery_failed';
 
-        Orders::transition($orderId, 'delivering', $target);
-        Log::error('delivery.finish', [
+        return self::fail($itemId, $orderId, $target, ['primary' => $a['outcome'], 'fallback' => $b['outcome']]);
+    }
+
+    /**
+     * Persisting the code, finishing the line and recognising the money happen together, so a
+     * line can never be delivered without a recorded code or without its ledger entry.
+     */
+    private static function finish(string $itemId, string $orderId, string $supplier, string $code): string
+    {
+        $requestId = self::requestId($itemId, $supplier);
+        $amount = (int) Db::one('SELECT amount FROM order_items WHERE id = ?', [$itemId])['amount'];
+
+        $pdo = Db::pdo();
+        $pdo->beginTransaction();
+
+        Db::run(
+            'UPDATE issue_requests SET status = ?, code = ?, last_error = NULL, updated_at = now()
+             WHERE request_id = ?',
+            ['issued', $code, $requestId],
+        );
+        Db::run(
+            'UPDATE order_items SET status = ?, code = ?, supplier = ?, updated_at = now()
+             WHERE id = ? AND status = ?',
+            ['delivered', $code, $supplier, $itemId, 'delivering'],
+        );
+        Ledger::record($orderId, 'revenue_recognised', $amount, $itemId);
+
+        $pdo->commit();
+
+        Log::info('delivery.finish', [
             'order_id' => $orderId,
-            'result' => $target,
-            'supplier_a' => $a['outcome'],
-            'supplier_b' => $b['outcome'],
+            'item_id' => $itemId,
+            'request_id' => $requestId,
+            'result' => 'delivered',
         ]);
 
-        return $target;
+        Orders::settle($orderId);
+
+        return 'delivered';
+    }
+
+    /** @param array<string, mixed> $context */
+    private static function fail(string $itemId, string $orderId, string $status, array $context): string
+    {
+        Orders::moveItem($itemId, 'delivering', $status);
+
+        Log::error('delivery.finish', ['order_id' => $orderId, 'item_id' => $itemId, 'result' => $status] + $context);
+
+        Orders::settle($orderId);
+
+        return $status;
     }
 
     /**
      * One supplier, up to DELIVERY_MAX_ATTEMPTS calls, always under the same request_id.
      *
-     * Only 'unknown' is retried. A definite refusal or an empty pool is an answer, and
-     * repeating the call would not change it.
+     * Only 'unknown' is retried. A definite refusal or an empty pool is an answer, and repeating
+     * the call would not change it.
      *
      * @return array{outcome: string, code: ?string, error: ?string}
      */
-    private static function attempt(string $supplier, string $orderId, string $sku): array
+    private static function attempt(string $supplier, string $itemId, string $orderId, string $sku): array
     {
-        $requestId = self::requestId($orderId, $supplier);
+        $requestId = self::requestId($itemId, $supplier);
         $maxAttempts = max(1, Env::int('DELIVERY_MAX_ATTEMPTS', 4));
         $result = ['outcome' => 'failed', 'code' => null, 'error' => 'no attempt made'];
 
@@ -213,12 +274,13 @@ final class Delivery
         $sawUnknown = ($prior['status'] ?? '') === 'unknown';
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-            self::track($requestId, $orderId, $supplier);
+            self::track($requestId, $itemId, $orderId, $supplier);
 
             $result = self::callSupplier($supplier, $requestId, $orderId, $sku);
 
             Log::info('supplier.call', [
                 'order_id' => $orderId,
+                'item_id' => $itemId,
                 'request_id' => $requestId,
                 'result' => $result['outcome'],
                 'supplier' => $supplier,
@@ -243,11 +305,11 @@ final class Delivery
             }
         }
 
-        // Uncertainty is sticky. Once an answer for this request_id was lost, a later 5xx or
-        // 409 on the SAME request_id refuses that call - it does not retract what an earlier
-        // call may already have issued. Only the supplier handing us the code resolves it.
-        // Downgrading to 'failed' here would authorise the fallback to B and hand the order a
-        // second key while the first one sits reserved.
+        // Uncertainty is sticky. Once an answer for this request_id was lost, a later 5xx or 409
+        // on the SAME request_id refuses that call - it does not retract what an earlier call may
+        // already have issued. Only the supplier handing us the code resolves it. Downgrading to
+        // 'failed' here would authorise the fallback and hand the line a second key while the
+        // first one sits reserved.
         if ($sawUnknown) {
             $result['outcome'] = 'unknown';
             self::storeFailure($requestId, $result);
@@ -257,18 +319,18 @@ final class Delivery
     }
 
     /**
-     * Records that an attempt is about to happen. On a retry only the counter moves: the
-     * previous status is left in place, so a worker that dies mid-call leaves the row saying
-     * 'unknown' rather than a cheerful 'pending'.
+     * Records that an attempt is about to happen. On a retry only the counter moves: the previous
+     * status is left in place, so a worker that dies mid-call leaves the row saying 'unknown'
+     * rather than a cheerful 'pending'.
      */
-    private static function track(string $requestId, string $orderId, string $supplier): void
+    private static function track(string $requestId, string $itemId, string $orderId, string $supplier): void
     {
         Db::run(
-            'INSERT INTO issue_requests (request_id, order_id, supplier, status, attempts)
-             VALUES (?, ?, ?, ?, 1)
+            'INSERT INTO issue_requests (request_id, order_id, item_id, supplier, status, attempts)
+             VALUES (?, ?, ?, ?, ?, 1)
              ON CONFLICT (request_id) DO UPDATE
                  SET attempts = issue_requests.attempts + 1, updated_at = now()',
-            [$requestId, $orderId, $supplier, 'pending'],
+            [$requestId, $orderId, $itemId, $supplier, 'pending'],
         );
     }
 
@@ -279,29 +341,6 @@ final class Delivery
             'UPDATE issue_requests SET status = ?, last_error = ?, updated_at = now() WHERE request_id = ?',
             [$result['outcome'], $result['error'], $requestId],
         );
-    }
-
-    /**
-     * Persisting the code and finishing the order happen together, so the order can never be
-     * delivered without a recorded code, nor hold a code while still sitting in 'delivering'.
-     */
-    private static function finish(string $orderId, string $requestId, string $code): string
-    {
-        $pdo = Db::pdo();
-        $pdo->beginTransaction();
-
-        Db::run(
-            'UPDATE issue_requests SET status = ?, code = ?, last_error = NULL, updated_at = now()
-             WHERE request_id = ?',
-            ['issued', $code, $requestId],
-        );
-        Orders::transition($orderId, 'delivering', 'delivered');
-
-        $pdo->commit();
-
-        Log::info('delivery.finish', ['order_id' => $orderId, 'request_id' => $requestId, 'result' => 'delivered']);
-
-        return 'delivered';
     }
 
     /** Exponential backoff with full jitter, so parallel workers do not retry in lockstep. */
@@ -338,10 +377,10 @@ final class Delivery
         curl_close($ch);
 
         if ($errno !== 0) {
-            // The split that stage 3 turns on. Left column: the request was sent but no
-            // complete answer came back - the supplier may have issued, so this is 'unknown'
-            // and may only be resolved by replaying the same request_id. Everything else
-            // never reached the supplier and is a safe, definite failure.
+            // The split that matters. Left column: the request was sent but no complete answer
+            // came back - the supplier may have issued, so this is 'unknown' and may only be
+            // resolved by replaying the same request_id. Everything else never reached the
+            // supplier and is a safe, definite failure.
             $unknown = [
                 CURLE_OPERATION_TIMEDOUT,
                 CURLE_PARTIAL_FILE,

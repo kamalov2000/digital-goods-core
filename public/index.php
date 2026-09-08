@@ -16,17 +16,41 @@ use App\Stock;
 
 $router = new Router();
 
+// Accepts either the stage 1 shape {"sku": "..."} or a basket
+// {"items": [{"sku": "...", "qty": 2}, "SKU-B"]}. Both end up as a list of line items.
 $router->add('POST', '/api/orders', function (): void {
     $body = Http::body();
-    $sku = isset($body['sku']) ? trim((string) $body['sku']) : '';
+    $lines = [];
 
-    if ($sku === '') {
+    if (isset($body['items']) && is_array($body['items'])) {
+        foreach ($body['items'] as $raw) {
+            if (is_string($raw)) {
+                $lines[] = ['sku' => trim($raw), 'qty' => 1];
+            } elseif (is_array($raw) && isset($raw['sku'])) {
+                $lines[] = [
+                    'sku' => trim((string) $raw['sku']),
+                    'qty' => max(1, min(20, (int) ($raw['qty'] ?? 1))),
+                ];
+            }
+        }
+    } elseif (isset($body['sku'])) {
+        $lines[] = ['sku' => trim((string) $body['sku']), 'qty' => 1];
+    }
+
+    foreach ($lines as $line) {
+        if ($line['sku'] === '') {
+            $lines = [];
+            break;
+        }
+    }
+
+    if ($lines === []) {
         Http::error('sku_required', 400);
 
         return;
     }
 
-    $order = Orders::create($sku);
+    $order = Orders::create($lines);
     if ($order === null) {
         Http::error('unknown_sku', 404);
 

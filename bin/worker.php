@@ -8,17 +8,20 @@ declare(strict_types=1);
  *   php bin/worker.php            run until SIGTERM/SIGINT
  *   php bin/worker.php --once     one pass, then exit (used by the race harness)
  *
- * Three duties per pass:
- *   1. orders in 'paid' -> call a supplier -> 'delivered'
+ * Duties per pass:
+ *   1. line items waiting for a code on a paid order
  *   2. events left with applied=false whose order has since been created
- *   3. recovery: orders stalled in 'delivery_failed' / 'out_of_stock', on a slower interval
+ * and, on a slower clock:
+ *   3. recovery of lines stalled in 'delivery_failed' / 'out_of_stock' / 'delivering'
+ *   4. refunds for lines we hold money for and cannot deliver
+ *   5. settling orders whose lines have all reached a terminal state
  *
  * Safe to run in several instances. Nothing here does work without first winning a claim:
- *   - Delivery::deliver() claims an order with the conditional UPDATE paid -> delivering
- *     (Orders::transition), so only one worker ever reaches the supplier for a given order;
+ *   - Delivery::runPending() claims a line with the conditional UPDATE pending -> delivering
+ *     (Orders::moveItem), so only one worker ever reaches a supplier for a given line;
  *   - Payments::apply() claims an event with UPDATE ... SET applied = true WHERE applied = false;
- *   - Delivery::runRecovery() claims a stalled order with UPDATE ... WHERE status = <the status
- *     it was read in>.
+ *   - Delivery::runRecovery() and Refunds::runPending() claim a line with
+ *     UPDATE ... WHERE status = <the status it was read in>.
  * Both are single statements evaluated under a row lock, so the losers see rowCount 0 and
  * simply move on. The unlocked SELECTs above them only nominate candidates.
  */
@@ -28,7 +31,9 @@ require __DIR__ . '/../vendor/autoload.php';
 use App\Delivery;
 use App\Env;
 use App\Log;
+use App\Orders;
 use App\Payments;
+use App\Refunds;
 
 $once = in_array('--once', array_slice($argv, 1), true);
 $batch = Env::int('WORKER_BATCH', 20);
@@ -57,6 +62,9 @@ do {
         if (time() >= $nextRecovery) {
             $nextRecovery = time() + $recoveryEvery;
             $work += Delivery::runRecovery($batch);
+            $work += Refunds::runPending($batch);
+            // safety net for a crash between finishing a line and deriving the order status
+            $work += Orders::settleStale($batch);
         }
     } catch (Throwable $e) {
         // one bad pass must not kill the loop; the claims are all conditional, so whatever

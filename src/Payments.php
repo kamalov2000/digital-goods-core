@@ -116,11 +116,7 @@ final class Payments
         // disagree with the order status. UNIQUE (order_id, type, ref) makes the write
         // idempotent - a replayed event_id cannot book the same money twice.
         if ($moved && $target === 'paid') {
-            Db::run(
-                'INSERT INTO ledger (order_id, type, amount, ref) VALUES (?, ?, ?, ?)
-                 ON CONFLICT (order_id, type, ref) DO NOTHING',
-                [$orderId, 'payment_received', (int) $event['amount'], $eventId],
-            );
+            Ledger::record($orderId, 'payment_received', (int) $event['amount'], $eventId);
         }
 
         $pdo->commit();
