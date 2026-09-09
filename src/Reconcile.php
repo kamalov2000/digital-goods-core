@@ -63,6 +63,17 @@ final class Reconcile
              LIMIT 500',
         );
 
+        // What the supplier got wrong and has not been put right yet. Detection is automatic
+        // and so is the resolution, so a non-empty list here means something is still in
+        // flight, not that somebody has to go and fix it by hand.
+        $openDiscrepancies = Db::all(
+            'SELECT kind, supplier, order_id, item_id, code, detail, detected_at
+             FROM supplier_discrepancies
+             WHERE resolved_at IS NULL
+             ORDER BY detected_at
+             LIMIT 500',
+        );
+
         return [
             'generated_at' => gmdate('c'),
             'stale_after_minutes' => $staleMinutes,
@@ -70,6 +81,7 @@ final class Reconcile
             'delivered_not_paid' => ['count' => count($deliveredNotPaid), 'orders' => $deliveredNotPaid],
             'orphaned_keys' => ['count' => count($orphanedKeys), 'keys' => $orphanedKeys],
             'stock_drift' => ['count' => count($stockDrift), 'skus' => $stockDrift],
+            'open_discrepancies' => ['count' => count($openDiscrepancies), 'items' => $openDiscrepancies],
         ];
     }
 

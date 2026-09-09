@@ -15,6 +15,7 @@ declare(strict_types=1);
  *   3. recovery of lines stalled in 'delivery_failed' / 'out_of_stock' / 'delivering'
  *   4. refunds for lines we hold money for and cannot deliver
  *   5. settling orders whose lines have all reached a terminal state
+ *   6. auditing the supplier: keys it took out of the pool that never reached a line
  *
  * Safe to run in several instances. Nothing here does work without first winning a claim:
  *   - Delivery::runPending() claims a line with the conditional UPDATE pending -> delivering
@@ -34,6 +35,7 @@ use App\Log;
 use App\Orders;
 use App\Payments;
 use App\Refunds;
+use App\SupplierAudit;
 
 $once = in_array('--once', array_slice($argv, 1), true);
 $batch = Env::int('WORKER_BATCH', 20);
@@ -65,6 +67,7 @@ do {
             $work += Refunds::runPending($batch);
             // safety net for a crash between finishing a line and deriving the order status
             $work += Orders::settleStale($batch);
+            $work += SupplierAudit::runAudit($batch);
         }
     } catch (Throwable $e) {
         // one bad pass must not kill the loop; the claims are all conditional, so whatever

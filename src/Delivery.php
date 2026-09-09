@@ -157,7 +157,7 @@ final class Delivery
 
         if ($unresolved !== null) {
             $supplier = (string) $unresolved['supplier'];
-            $resumed = self::attempt($supplier, $itemId, $orderId, $sku);
+            $resumed = self::trySupplier($supplier, $itemId, $orderId, $sku);
 
             if ($resumed['outcome'] === 'issued') {
                 return self::finish($itemId, $orderId, $supplier, (string) $resumed['code']);
@@ -166,7 +166,7 @@ final class Delivery
             return self::fail($itemId, $orderId, 'delivery_failed', ['reason' => 'still_unresolved']);
         }
 
-        $a = self::attempt($primary, $itemId, $orderId, $sku);
+        $a = self::trySupplier($primary, $itemId, $orderId, $sku);
         if ($a['outcome'] === 'issued') {
             return self::finish($itemId, $orderId, $primary, (string) $a['code']);
         }
@@ -190,7 +190,7 @@ final class Delivery
             'reason' => $a['outcome'],
         ]);
 
-        $b = self::attempt($fallback, $itemId, $orderId, $sku);
+        $b = self::trySupplier($fallback, $itemId, $orderId, $sku);
         if ($b['outcome'] === 'issued') {
             return self::finish($itemId, $orderId, $fallback, (string) $b['code']);
         }
@@ -216,19 +216,45 @@ final class Delivery
         $pdo = Db::pdo();
         $pdo->beginTransaction();
 
-        Db::run(
-            'UPDATE issue_requests SET status = ?, code = ?, last_error = NULL, updated_at = now()
-             WHERE request_id = ?',
-            ['issued', $code, $requestId],
-        );
-        Db::run(
-            'UPDATE order_items SET status = ?, code = ?, supplier = ?, updated_at = now()
-             WHERE id = ? AND status = ?',
-            ['delivered', $code, $supplier, $itemId, 'delivering'],
-        );
-        Ledger::record($orderId, 'revenue_recognised', $amount, $itemId);
+        try {
+            Db::run(
+                'UPDATE issue_requests SET status = ?, code = ?, last_error = NULL, updated_at = now()
+                 WHERE request_id = ?',
+                ['issued', $code, $requestId],
+            );
+            Db::run(
+                'UPDATE order_items SET status = ?, code = ?, supplier = ?, updated_at = now()
+                 WHERE id = ? AND status = ?',
+                ['delivered', $code, $supplier, $itemId, 'delivering'],
+            );
+            Ledger::record($orderId, 'revenue_recognised', $amount, $itemId);
 
-        $pdo->commit();
+            $pdo->commit();
+        } catch (\PDOException $e) {
+            // Last line of defence. acceptCode() already refused codes that sit on another line,
+            // but two lines validating the same code at the same instant would both get past it;
+            // the unique index on order_items.code is what actually decides. The loser records
+            // the discrepancy and gives the line back - the next pass replays the request_id,
+            // acceptCode now sees the code taken, and the line is served by the other supplier.
+            $pdo->rollBack();
+
+            SupplierAudit::record(
+                'duplicate_code',
+                $requestId,
+                $orderId,
+                $itemId,
+                $supplier,
+                $code,
+                'code lost the race for the unique index: ' . $e->getMessage(),
+            );
+            self::storeFailure($requestId, [
+                'outcome' => 'invalid_code',
+                'code' => null,
+                'error' => 'duplicate:' . $code,
+            ]);
+
+            return self::fail($itemId, $orderId, 'delivery_failed', ['reason' => 'duplicate_code']);
+        }
 
         Log::info('delivery.finish', [
             'order_id' => $orderId,
@@ -252,6 +278,122 @@ final class Delivery
         Orders::settle($orderId);
 
         return $status;
+    }
+
+    /**
+     * One supplier, answer included. Nothing a supplier says is taken at face value: a code is
+     * only accepted once we have checked that it is a real key, that it was reserved for this
+     * order, and that it is not already sitting on another line.
+     *
+     * A rejected code counts as a definite refusal from that supplier, which is safe to fall
+     * back from: a duplicate or an invented code means the supplier reserved nothing for us, it
+     * simply said something untrue.
+     *
+     * @return array{outcome: string, code: ?string, error: ?string}
+     */
+    private static function trySupplier(string $supplier, string $itemId, string $orderId, string $sku): array
+    {
+        $result = self::attempt($supplier, $itemId, $orderId, $sku);
+
+        if ($result['outcome'] !== 'issued') {
+            return $result;
+        }
+
+        $code = (string) $result['code'];
+        $verdict = self::acceptCode($itemId, $orderId, $code);
+
+        if ($verdict === 'ok') {
+            return $result;
+        }
+
+        $requestId = self::requestId($itemId, $supplier);
+        $kind = $verdict === 'duplicate' ? 'duplicate_code' : 'foreign_code';
+
+        SupplierAudit::record(
+            $kind,
+            $requestId,
+            $orderId,
+            $itemId,
+            $supplier,
+            $code,
+            $verdict === 'duplicate' ? 'code already issued elsewhere' : 'code is not a key of ours',
+        );
+        self::storeFailure($requestId, [
+            'outcome' => 'invalid_code',
+            'code' => null,
+            'error' => $verdict . ':' . $code,
+        ]);
+        SupplierAudit::resolve($requestId, $kind, $code, 'code rejected, line served elsewhere');
+
+        return ['outcome' => 'invalid_code', 'code' => null, 'error' => $verdict];
+    }
+
+    /**
+     * May this code be handed to a customer?
+     *
+     * @return string one of ok, duplicate, foreign
+     */
+    private static function acceptCode(string $itemId, string $orderId, string $code): string
+    {
+        $key = Db::one('SELECT order_id FROM key_pool WHERE code = ?', [$code]);
+
+        // a code that is not in the pool at all was invented on the spot
+        if ($key === null) {
+            return 'foreign';
+        }
+
+        // a real key of ours that is already on someone else's line: the supplier handed us a
+        // copy of a code it had issued before
+        $used = Db::one('SELECT id FROM order_items WHERE code = ? AND id <> ?', [$code, $itemId]);
+        if ($used !== null) {
+            return 'duplicate';
+        }
+
+        // a real key that was never taken out of the pool - the supplier is claiming an issue
+        // it never made
+        if ($key['order_id'] === null) {
+            return 'foreign';
+        }
+
+        // a real key, genuinely reserved, but for a different order
+        return $key['order_id'] === $orderId ? 'ok' : 'duplicate';
+    }
+
+    /**
+     * Asks the supplier what it holds for this request_id.
+     *
+     * A supplier that lies in its answers still knows what it did, and this is the only way to
+     * tell a genuine refusal apart from an error returned for a request it actually fulfilled.
+     * Without it the fallback would hand the line a second key.
+     */
+    private static function confirm(string $supplier, string $requestId): ?string
+    {
+        $url = rtrim(Env::get('SUPPLIER_' . $supplier . '_URL', 'http://127.0.0.1:9001'), '/')
+            . '/issue/' . rawurlencode($requestId);
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => Env::int('DELIVERY_CONNECT_TIMEOUT_SEC', 2),
+            CURLOPT_TIMEOUT => Env::int('DELIVERY_TIMEOUT_SEC', 5),
+        ]);
+
+        $response = curl_exec($ch);
+        $errno = curl_errno($ch);
+        curl_close($ch);
+
+        if ($errno !== 0) {
+            return null;
+        }
+
+        $decoded = json_decode((string) $response, true);
+        $decoded = is_array($decoded) ? $decoded : [];
+
+        if (($decoded['status'] ?? '') === 'ok' && !empty($decoded['code'])) {
+            return (string) $decoded['code'];
+        }
+
+        return null;
     }
 
     /**
@@ -302,6 +444,37 @@ final class Delivery
 
             if ($attempt < $maxAttempts) {
                 self::backoff($attempt);
+            }
+        }
+
+        // A supplier answer is not the only thing it knows. Before a refusal releases us to the
+        // fallback, and before an unresolved attempt is parked for recovery, ask it directly what
+        // it holds for this request_id. That is what turns an error returned for a request the
+        // supplier did fulfil from a double issue into a non-event.
+        if ($result['outcome'] === 'failed' || $result['outcome'] === 'unknown') {
+            $confirmed = self::confirm($supplier, $requestId);
+
+            if ($confirmed !== null) {
+                Log::info('supplier.confirm', [
+                    'order_id' => $orderId,
+                    'item_id' => $itemId,
+                    'request_id' => $requestId,
+                    'result' => 'issued',
+                    'supplier' => $supplier,
+                    'after' => $result['outcome'],
+                ]);
+                SupplierAudit::record(
+                    'error_after_issue',
+                    $requestId,
+                    $orderId,
+                    $itemId,
+                    $supplier,
+                    $confirmed,
+                    'supplier answered ' . $result['outcome'] . ' for a request it had fulfilled',
+                );
+                SupplierAudit::resolve($requestId, 'error_after_issue', $confirmed, 'code recovered by confirmation');
+
+                return ['outcome' => 'issued', 'code' => $confirmed, 'error' => null];
             }
         }
 
