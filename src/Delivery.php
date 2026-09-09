@@ -31,17 +31,25 @@ final class Delivery
      */
     public static function runPending(int $limit): int
     {
+        // Only paid orders are in this queue at all, so paid work is served ahead of unpaid by
+        // construction. Within it, the order whose money we have been holding longest goes first.
         $items = Db::all(
-            "SELECT i.id FROM order_items i
+            "SELECT i.id, i.supplier FROM order_items i
              JOIN orders o ON o.id = i.order_id
+             LEFT JOIN ledger l ON l.order_id = o.id AND l.type = 'payment_received'
              WHERE i.status = 'pending' AND o.status IN ('paid', 'delivering')
-             ORDER BY i.created_at
+             ORDER BY l.created_at NULLS LAST, i.created_at
              LIMIT ?",
             [$limit],
         );
 
         $done = 0;
         foreach ($items as $row) {
+            // skip rather than claim-and-give-back when the supplier has no capacity left
+            if (!Throttle::available((string) $row['supplier'])) {
+                continue;
+            }
+
             if (self::deliverItem((string) $row['id'])) {
                 $done++;
             }
@@ -163,12 +171,23 @@ final class Delivery
                 return self::finish($itemId, $orderId, $supplier, (string) $resumed['code']);
             }
 
+            if ($resumed['outcome'] === 'rate_limited') {
+                return self::requeue($itemId, $orderId);
+            }
+
             return self::fail($itemId, $orderId, 'delivery_failed', ['reason' => 'still_unresolved']);
         }
 
         $a = self::trySupplier($primary, $itemId, $orderId, $sku);
         if ($a['outcome'] === 'issued') {
             return self::finish($itemId, $orderId, $primary, (string) $a['code']);
+        }
+
+        // Out of capacity for now. Nothing was asked of the supplier, so the line simply goes
+        // back on the queue - it must not be failed, refunded, or handed to the other supplier,
+        // which has its own limit to respect.
+        if ($a['outcome'] === 'rate_limited') {
+            return self::requeue($itemId, $orderId);
         }
 
         // THE RULE: no fallback while the primary supplier is 'unknown'.
@@ -193,6 +212,10 @@ final class Delivery
         $b = self::trySupplier($fallback, $itemId, $orderId, $sku);
         if ($b['outcome'] === 'issued') {
             return self::finish($itemId, $orderId, $fallback, (string) $b['code']);
+        }
+
+        if ($b['outcome'] === 'rate_limited') {
+            return self::requeue($itemId, $orderId);
         }
 
         // Both empty is a stock problem, not an integration failure: recoverable by restocking,
@@ -266,6 +289,15 @@ final class Delivery
         Orders::settle($orderId);
 
         return 'delivered';
+    }
+
+    /** Puts a claimed line back on the queue without counting it as an attempt. */
+    private static function requeue(string $itemId, string $orderId): string
+    {
+        Orders::moveItem($itemId, 'delivering', 'pending');
+        Orders::settle($orderId);
+
+        return 'rate_limited';
     }
 
     /** @param array<string, mixed> $context */
@@ -416,6 +448,20 @@ final class Delivery
         $sawUnknown = ($prior['status'] ?? '') === 'unknown';
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            // Pace ourselves before recording an attempt: a call we are not allowed to make yet
+            // is not a failed attempt, it is a line that stays in the queue.
+            if (!Throttle::acquire($supplier)) {
+                Log::info('supplier.throttled', [
+                    'order_id' => $orderId,
+                    'item_id' => $itemId,
+                    'request_id' => $requestId,
+                    'result' => 'rate_limited',
+                    'supplier' => $supplier,
+                ]);
+
+                return ['outcome' => 'rate_limited', 'code' => null, 'error' => 'no slot available'];
+            }
+
             self::track($requestId, $itemId, $orderId, $supplier);
 
             $result = self::callSupplier($supplier, $requestId, $orderId, $sku);

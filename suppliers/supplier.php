@@ -25,6 +25,7 @@ declare(strict_types=1);
  *   ERROR_AFTER_ISSUE_RATE  reserve and commit the key, then answer 5xx anyway
  *   DUPLICATE_RATE        answer with a code that was already issued to someone else
  *   FOREIGN_CODE_RATE     answer with a code that was never in this pool at all
+ *   RATE_LIMIT_PER_MIN    accept only this many POST /issue calls per minute (0 = no limit)
  *
  * The ordering is the whole point. FAIL_RATE fires before any side effect, so it is a refusal
  * the client may trust. DUPLICATE and FOREIGN reserve nothing, so they burn no key. TIMEOUT and
@@ -113,6 +114,37 @@ if ($requestId === '' || $orderId === '' || $sku === '') {
 }
 
 $roll = static fn (float $rate): bool => $rate > 0 && (mt_rand() / mt_getrandmax()) < $rate;
+
+// Rate limit, enforced before any work and only on the issuing endpoint - GET /issue/{id} is a
+// question about the past and costs the supplier nothing. Counting and recording the call happen
+// under an advisory lock, so concurrent callers cannot all squeeze through the last free slot.
+$rateLimit = Env::int('RATE_LIMIT_PER_MIN', 0);
+if ($rateLimit > 0) {
+    $pdo = supplier_pdo();
+    $pdo->beginTransaction();
+
+    $stmt = $pdo->prepare('SELECT pg_advisory_xact_lock(hashtext(?))');
+    $stmt->execute(['supplier_rate_' . $supplier]);
+
+    $stmt = $pdo->prepare(
+        "SELECT count(*) AS n FROM supplier_calls
+         WHERE supplier = ? AND called_at > now() - interval '1 minute'"
+    );
+    $stmt->execute([$supplier]);
+
+    if ((int) $stmt->fetch()['n'] >= $rateLimit) {
+        $pdo->rollBack();
+        supplier_log('rate limited', ['supplier' => $supplier, 'request_id' => $requestId]);
+        header('Retry-After: 5');
+        supplier_reply(429, ['status' => 'error', 'reason' => 'rate_limited']);
+
+        return true;
+    }
+
+    $stmt = $pdo->prepare('INSERT INTO supplier_calls (supplier) VALUES (?)');
+    $stmt->execute([$supplier]);
+    $pdo->commit();
+}
 
 if ($roll(Env::float('FAIL_RATE', 0.0))) {
     // injected before touching the database: nothing was issued, so the client may safely treat
