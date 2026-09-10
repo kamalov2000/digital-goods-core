@@ -92,10 +92,15 @@ wait_final() {
 
 free_keys() { php -r 'require "vendor/autoload.php"; echo App\Db::one("SELECT count(*) c FROM key_pool WHERE order_id IS NULL")["c"];'; }
 
-# keeps exactly $1 free keys in the pool, deleting the rest
+# Leaves exactly $1 free generic keys in the pool and nothing else.
 trim_pool() {
     php -r 'require "vendor/autoload.php";
-        App\Db::run("DELETE FROM key_pool WHERE code IN (SELECT code FROM key_pool WHERE order_id IS NULL OFFSET " . (int) $argv[1] . ")");
+        // Drop every sku-bound key first. Another suite may have left a deep pool of keys
+        // that only fit its own sku, and keeping those would leave this basket with a pool
+        // that looks full but cannot serve it.
+        App\Db::run("DELETE FROM key_pool WHERE order_id IS NULL AND sku IS NOT NULL");
+        App\Db::run("DELETE FROM key_pool WHERE code IN (SELECT code FROM key_pool
+                     WHERE order_id IS NULL ORDER BY code OFFSET " . (int) $argv[1] . ")");
         App\Stock::recompute();' "$1"
 }
 

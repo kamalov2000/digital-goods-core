@@ -1,4 +1,4 @@
-.PHONY: up down migrate seed seed-load serve suppliers worker test race chaos recover partial dishonest bench-catalog reconcile ledger-check
+.PHONY: up down migrate seed seed-load serve suppliers worker test race chaos recover partial dishonest surge bench-catalog reconcile ledger-check
 
 up:
 	docker compose up -d
@@ -64,6 +64,11 @@ partial:
 dishonest:
 	docker compose up -d postgres
 	docker compose run --rm --build runner bash tests/dishonest.sh
+
+# stage 2 task 3: more orders than the supplier accepts per minute
+surge:
+	docker compose up -d postgres
+	docker compose run --rm --build runner bash tests/surge.sh
 
 # stage 5: 5000 skus / 200k keys, query plans and storefront latency
 bench-catalog:

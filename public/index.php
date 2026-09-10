@@ -12,6 +12,7 @@ use App\Orders;
 use App\Payments;
 use App\Reconcile;
 use App\Router;
+use App\Throttle;
 use App\Stock;
 
 $router = new Router();
@@ -130,6 +131,10 @@ $router->add('GET', '/api/catalog', function (): void {
     }
 
     Http::json(['limit' => $limit, 'offset' => $offset, 'shared_pool' => $shared, 'items' => $items]);
+});
+
+$router->add('GET', '/api/admin/queue', function (): void {
+    Http::json(Throttle::snapshot());
 });
 
 $router->add('GET', '/api/admin/reconcile', function (): void {

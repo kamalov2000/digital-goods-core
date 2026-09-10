@@ -129,7 +129,14 @@ echo
 echo "=== phase 1: chaos with recovery off and a short pool ==="
 suppliers 0.35 0.45 0.35 0.35
 # leave only a handful of keys so some orders genuinely run out of stock
-php -r 'require "vendor/autoload.php"; App\Db::run("DELETE FROM key_pool WHERE code IN (SELECT code FROM key_pool WHERE order_id IS NULL OFFSET " . (int) $argv[1] . ")"); App\Stock::recompute();' "$POOL_DURING_CHAOS"
+php -r 'require "vendor/autoload.php";
+        // Drop every sku-bound key first. Another suite may have left a deep pool of keys
+        // that only fit its own sku, and keeping those would leave this basket with a pool
+        // that looks full but cannot serve it.
+        App\Db::run("DELETE FROM key_pool WHERE order_id IS NULL AND sku IS NOT NULL");
+        App\Db::run("DELETE FROM key_pool WHERE code IN (SELECT code FROM key_pool
+                     WHERE order_id IS NULL ORDER BY code OFFSET " . (int) $argv[1] . ")");
+        App\Stock::recompute();' "$POOL_DURING_CHAOS"
 note "free keys in the pool" "SELECT count(*) FROM key_pool WHERE order_id IS NULL"
 
 for _ in $(seq 1 "$ORDER_COUNT"); do
