@@ -1,0 +1,6 @@
+# Everything in here is executed inside a Linux container: the shell harnesses run under bash,
+# and a CRLF checkout breaks them outright ($'\r': command not found). Normalise to LF in the
+# repository and check out LF everywhere, whatever the client platform is configured to do.
+* text=auto eol=lf
+
+*.pdf binary
