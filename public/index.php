@@ -6,6 +6,7 @@ require __DIR__ . '/../vendor/autoload.php';
 
 use App\Db;
 use App\Env;
+use App\History;
 use App\Http;
 use App\Log;
 use App\Orders;
@@ -131,6 +132,34 @@ $router->add('GET', '/api/catalog', function (): void {
     }
 
     Http::json(['limit' => $limit, 'offset' => $offset, 'shared_pool' => $shared, 'items' => $items]);
+});
+
+// What an order and its money looked like at a past instant, folded out of the append-only
+// logs. ?at= accepts anything strtotime understands; it defaults to now.
+$router->add('GET', '/api/admin/orders/{id}/at', function (array $args): void {
+    $at = isset($_GET['at']) ? (string) $_GET['at'] : 'now';
+    $ts = strtotime($at);
+
+    if ($ts === false) {
+        Http::error('bad_timestamp', 400);
+
+        return;
+    }
+
+    Http::json(History::stateAt($args['id'], gmdate('c', $ts)));
+});
+
+$router->add('GET', '/api/admin/report', function (): void {
+    $from = strtotime((string) ($_GET['from'] ?? '-1 day'));
+    $to = strtotime((string) ($_GET['to'] ?? 'now'));
+
+    if ($from === false || $to === false || $from > $to) {
+        Http::error('bad_period', 400);
+
+        return;
+    }
+
+    Http::json(History::report(gmdate('c', $from), gmdate('c', $to)));
 });
 
 $router->add('GET', '/api/admin/queue', function (): void {

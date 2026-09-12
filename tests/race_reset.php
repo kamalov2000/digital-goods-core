@@ -19,7 +19,7 @@ $pdo->beginTransaction();
 // run sit inside the current sliding window and make both the limiter and the assertions
 // about it measure two runs at once.
 Db::run('TRUNCATE supplier_issues, issue_requests, order_items, payment_events, ledger,
-                 supplier_discrepancies, supplier_calls, delivery_slots');
+                 supplier_discrepancies, supplier_calls, delivery_slots, order_events');
 Db::run('UPDATE key_pool SET order_id = NULL, reserved_at = NULL WHERE order_id IS NOT NULL');
 Db::run('DELETE FROM orders');
 Stock::recompute();
