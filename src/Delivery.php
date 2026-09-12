@@ -245,11 +245,17 @@ final class Delivery
                  WHERE request_id = ?',
                 ['issued', $code, $requestId],
             );
-            Db::run(
+            $moved = Db::run(
                 'UPDATE order_items SET status = ?, code = ?, supplier = ?, updated_at = now()
                  WHERE id = ? AND status = ?',
                 ['delivered', $code, $supplier, $itemId, 'delivering'],
-            );
+            )->rowCount();
+
+            // only a line that actually moved gets an entry: history must record what happened,
+            // not what this process was about to do
+            if ($moved === 1) {
+                History::record('item.status', $orderId, $itemId, 'delivering', 'delivered', $amount);
+            }
             Ledger::record($orderId, 'revenue_recognised', $amount, $itemId);
 
             $pdo->commit();

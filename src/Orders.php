@@ -53,11 +53,12 @@ final class Orders
         );
 
         foreach ($items as $product) {
+            $itemId = 'itm_' . bin2hex(random_bytes(8));
             Db::run(
                 'INSERT INTO order_items (id, order_id, sku, amount, currency, supplier, status)
                  VALUES (?, ?, ?, ?, ?, ?, ?)',
                 [
-                    'itm_' . bin2hex(random_bytes(8)),
+                    $itemId,
                     $id,
                     $product['sku'],
                     (int) $product['price'],
@@ -66,7 +67,10 @@ final class Orders
                     'pending',
                 ],
             );
+            History::record('item.status', $id, $itemId, null, 'pending', (int) $product['price']);
         }
+
+        History::record('order.created', $id, null, null, 'created', $total);
 
         $pdo->commit();
 
@@ -116,6 +120,7 @@ final class Orders
         )->rowCount();
 
         if ($moved === 1) {
+            History::record('order.status', $id, null, $from, $to);
             Log::info('order.transition', ['order_id' => $id, 'result' => $to, 'from' => $from]);
         }
 
@@ -161,6 +166,7 @@ final class Orders
         );
 
         if ($row !== null) {
+            History::record('order.status', $orderId, null, null, (string) $row['status']);
             Log::info('order.settle', ['order_id' => $orderId, 'result' => $row['status']]);
 
             return (string) $row['status'];
@@ -201,10 +207,20 @@ final class Orders
      */
     public static function moveItem(string $itemId, string $from, string $to): bool
     {
-        return Db::run(
-            'UPDATE order_items SET status = ?, updated_at = now() WHERE id = ? AND status = ?',
+        $row = Db::one(
+            'UPDATE order_items SET status = ?, updated_at = now()
+             WHERE id = ? AND status = ?
+             RETURNING order_id, amount',
             [$to, $itemId, $from],
-        )->rowCount() === 1;
+        );
+
+        if ($row === null) {
+            return false;
+        }
+
+        History::record('item.status', (string) $row['order_id'], $itemId, $from, $to, (int) $row['amount']);
+
+        return true;
     }
 
     public static function exists(string $id): bool
