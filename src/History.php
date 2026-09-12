@@ -8,7 +8,7 @@ namespace App;
  * The append-only side of the system: what happened, when, and what that adds up to.
  *
  * State comes from order_events, money from the ledger. Both are sealed against UPDATE and
- * DELETE at the database level (see migrations/009_history.sql), so any answer given here is
+ * DELETE at the database level (see migrations/008_history.sql), so any answer given here is
  * reproducible - asking the same question twice about the same past instant cannot change.
  */
 final class History
